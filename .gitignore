@@ -1,0 +1,7 @@
+/target
+/target-bookworm
+.env
+.tursi/
+bench/jobs/
+__pycache__/
+*.pyc

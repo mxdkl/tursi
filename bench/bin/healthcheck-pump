@@ -1,0 +1,10 @@
+#!/bin/sh
+# Rootless podman without systemd never runs container health checks, so
+# compose's `service_healthy` waits forever. Run the checks ourselves while a
+# pier job is alive.
+while pgrep -f "datacurve-pie[r]/bin/python" >/dev/null; do
+    for c in $(podman ps -q --filter health=starting 2>/dev/null); do
+        podman healthcheck run "$c" >/dev/null 2>&1
+    done
+    sleep 1
+done

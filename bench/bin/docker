@@ -1,0 +1,41 @@
+#!/bin/sh
+# docker -> podman shim for Pier on rootless podman.
+#   * `docker compose cp` -> `podman cp` (docker-compose's cp passes a host-
+#     mapped UID that podman rejects under rootless userns)
+#   * other `docker compose ...` -> real docker-compose v2 against the podman
+#     socket, with ORIGINAL quoting preserved ("$@") — critical for `exec ...
+#     sh -c '<hook with spaces/&&/>'` collect hooks
+#   * everything else -> podman
+export DOCKER_HOST="${DOCKER_HOST:-unix:///tmp/runtime-1000/podman/podman.sock}"
+
+if [ "$1" != "compose" ]; then
+    exec podman "$@"
+fi
+shift
+
+# Is this a `cp` subcommand? (cp operands are paths without spaces → safe to
+# word-split-parse. Everything else must keep "$@" intact.)
+is_cp=0
+for a in "$@"; do [ "$a" = "cp" ] && { is_cp=1; break; }; done
+
+if [ "$is_cp" -eq 1 ]; then
+    project=""
+    rest=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --project-name|-p) project="$2"; shift 2 ;;
+            --project-directory|-f|--env-file|--profile) shift 2 ;;
+            cp) shift; rest="$*"; break ;;
+            -*) shift ;;
+            *) shift ;;
+        esac
+    done
+    a=$(printf '%s\n' $rest | sed -n 1p)
+    b=$(printf '%s\n' $rest | sed -n 2p)
+    case "$a" in
+        *:*) svc=${a%%:*}; path=${a#*:}; exec podman cp "${project}-${svc}-1:${path}" "$b" ;;  # copy out
+        *)   svc=${b%%:*}; path=${b#*:}; exec podman cp "$a" "${project}-${svc}-1:${path}" ;;   # copy in
+    esac
+fi
+
+exec docker-compose "$@"
