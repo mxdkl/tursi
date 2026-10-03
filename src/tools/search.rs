@@ -34,7 +34,8 @@ pub async fn search(tb: &Toolbox, args: &Value) -> Result<String> {
     let args: SearchArgs = serde_json::from_value(args.clone())?;
     let max = args.max_results.unwrap_or(50).clamp(1, 500);
 
-    let mut argv: Vec<String> = vec!["rg".into()];
+    // Harness state is never what the model is looking for.
+    let mut argv: Vec<String> = vec!["rg".into(), "--glob".into(), "!.tursi/**".into()];
     let files_only = match (&args.pattern, &args.glob) {
         (None, None) => bail!("give pattern, glob, or both"),
         (None, Some(glob)) => {

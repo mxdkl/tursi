@@ -39,6 +39,7 @@ pub async fn run(
         &card,
         session_id,
         sandbox,
+        secrets.clone(),
         true, // afk
         true, // headless: edit in place
         session.resumed,
@@ -57,6 +58,7 @@ pub async fn run(
     let drain = tokio::spawn(async move {
         let mut armed = 0usize;
         while let Some(ev) = event_rx.recv().await {
+            let indent = if ev.agent == ROOT { "" } else { "    " };
             match ev.kind {
                 EventKind::Approval(req) => {
                     let _ = req.reply.send(ApprovalReply::Reject {
@@ -66,13 +68,14 @@ pub async fn run(
                 EventKind::Ask(req) => {
                     let _ = req.reply.send("(headless: no user)".into());
                 }
-                EventKind::ToolStarted { name, summary } => eprintln!("  ▸ {name} {summary}"),
+                EventKind::ToolStarted { name, summary } => eprintln!("{indent}  ▸ {name} {summary}"),
                 EventKind::ToolFinished { name, content, is_error } => {
                     let first = content.lines().next().unwrap_or("").chars().take(100).collect::<String>();
-                    eprintln!("  {} {name}: {first}", if is_error { '✗' } else { '✓' });
+                    eprintln!("{indent}  {} {name}: {first}", if is_error { '✗' } else { '✓' });
                 }
                 EventKind::Monitors { armed: list } => armed = list.len(),
                 EventKind::MonitorWoke { text } => eprintln!("  ⚡ {text}"),
+                EventKind::TaskDone { summary } if ev.agent != ROOT => eprintln!("{indent}  ● (subagent) {}", summary.lines().next().unwrap_or("")),
                 EventKind::TaskDone { summary } => {
                     eprintln!("  ● {summary}");
                     let _ = done_tx.send((summary, armed)).await;

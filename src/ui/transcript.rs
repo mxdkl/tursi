@@ -13,7 +13,7 @@ pub enum Entry {
     User(String),
     /// A block of model text (one turn's prose, or a streamed partial).
     Agent(String),
-    Tool { name: String, summary: String, result: Option<ToolResult> },
+    Tool { name: String, summary: String, result: Option<ToolResult>, trace: Vec<String> },
     Diff(FileDiff),
     /// Task end: `✻ Worked for 1m 12s · done 08:20 · $0.012 · ctx 23k`.
     Done { ok: bool, elapsed: Duration, at: String, cost_usd: f64, ctx_tokens: u64 },
@@ -49,7 +49,7 @@ pub fn render(entries: &[Entry], width: usize, verbose: bool) -> Vec<Line<'stati
                 out.push(Line::raw(""));
                 block(&mut out, "● ", text, Style::new(), Style::new(), width);
             }
-            Entry::Tool { name, summary, result } => {
+            Entry::Tool { name, summary, result, trace } => {
                 out.push(Line::raw(""));
                 let bullet_style = match result {
                     None => Style::new().fg(Color::Yellow),
@@ -58,6 +58,18 @@ pub fn render(entries: &[Entry], width: usize, verbose: bool) -> Vec<Line<'stati
                 };
                 let head = if summary.is_empty() { name.clone() } else { format!("{name}({})", clip(summary, width.saturating_sub(name.len() + 5))) };
                 out.push(Line::from(vec![Span::styled("● ", bullet_style), Span::styled(head, Style::new().add_modifier(Modifier::BOLD))]));
+                // A subagent's work: one live line while it runs, the whole
+                // trace only when asked for (Ctrl+O).
+                if !trace.is_empty() {
+                    if verbose {
+                        for line in trace {
+                            out.push(Line::from(vec![Span::styled("     · ", DIM), Span::styled(clip(line, width.saturating_sub(7)), DIM)]));
+                        }
+                    } else if result.is_none() {
+                        let last = trace.last().map(|l| clip(l, width.saturating_sub(30))).unwrap_or_default();
+                        out.push(Line::styled(format!("  ⎿  working… {} steps · {last}", trace.len()), Style::new().fg(Color::Yellow)));
+                    }
+                }
                 // A successful edit/write is told by its diff; the "applied N
                 // hunk(s)" line only repeats it (verbose shows both).
                 let diff_follows = matches!(entries.get(idx + 1), Some(Entry::Diff(_)));
@@ -156,7 +168,7 @@ pub fn from_messages(messages: &[crate::api::Message]) -> Vec<Entry> {
                         .chars()
                         .take(60)
                         .collect();
-                    out.push(Entry::Tool { name: call.name.clone(), summary, result: None });
+                    out.push(Entry::Tool { name: call.name.clone(), summary, result: None, trace: Vec::new() });
                 }
             }
             Message::ToolResult { content, is_error, .. } => {
@@ -248,6 +260,7 @@ mod tests {
                 name: "execute_command".into(),
                 summary: "cargo test".into(),
                 result: Some(ToolResult { content: (1..=8).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"), is_error: false }),
+                trace: Vec::new(),
             },
         ];
         let t = text(&render(&entries, 80, false));
@@ -282,10 +295,11 @@ mod tests {
                 name: "execute_command".into(),
                 summary: "cargo install --path . --locked".into(),
                 result: Some(ToolResult { content: "1 ✓ cargo install --path . --locked    (8.4s) [full: log#0]\n     Replacing /home/player1/.cargo/bin/tursi\n     Replaced package `tursi v0.1.0`\n  -rwxr-xr-x 1 player1 14176016 tursi".into(), is_error: false }),
+                trace: Vec::new(),
             },
-            Entry::Tool { name: "edit".into(), summary: "BENCH.md".into(), result: Some(ToolResult { content: "applied 1 hunk(s) to BENCH.md".into(), is_error: false }) },
+            Entry::Tool { name: "edit".into(), summary: "BENCH.md".into(), result: Some(ToolResult { content: "applied 1 hunk(s) to BENCH.md".into(), is_error: false }), trace: Vec::new() },
             Entry::Diff(d),
-            Entry::Tool { name: "execute_command".into(), summary: "cargo test".into(), result: Some(ToolResult { content: "1 ✗ cargo test    exit 101 (2.1s)\n  error[E0425]: cannot find value `ui`".into(), is_error: true }) },
+            Entry::Tool { name: "execute_command".into(), summary: "cargo test".into(), result: Some(ToolResult { content: "1 ✗ cargo test    exit 101 (2.1s)\n  error[E0425]: cannot find value `ui`".into(), is_error: true }), trace: Vec::new() },
             Entry::Agent("Both binaries are rebuilt from the committed tree and verified:\n\n- ~/.cargo/bin/tursi: reinstalled.\n- target-bookworm/release/tursi: rebuilt.".into()),
             Entry::Done { ok: true, elapsed: Duration::from_secs(55), at: "8:23 AM".into(), cost_usd: 0.0021, ctx_tokens: 5_800 },
         ];
@@ -312,7 +326,7 @@ mod tests {
         let entries = from_messages(&messages);
         assert!(matches!(&entries[0], Entry::User(t) if t == "add a test"));
         assert!(matches!(&entries[1], Entry::Agent(t) if t == "Looking."));
-        assert!(matches!(&entries[2], Entry::Tool { name, summary, result: Some(r) } if name == "read" && summary == "src/lib.rs" && !r.is_error));
+        assert!(matches!(&entries[2], Entry::Tool { name, summary, result: Some(r), .. } if name == "read" && summary == "src/lib.rs" && !r.is_error));
         assert!(matches!(&entries[3], Entry::Note(t) if t.starts_with("[verify]")));
     }
 

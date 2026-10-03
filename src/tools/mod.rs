@@ -1,5 +1,6 @@
 //! Tool roster (§4): schemas, the approval-gated executor, and dispatch.
 
+pub mod agent;
 pub mod ask;
 pub mod custom;
 pub mod debugger;
@@ -27,8 +28,14 @@ pub struct Toolbox {
     pub lsp: crate::lsp::Manager,
     pub debugger: Option<crate::dap::Session>,
     pub rizin: Option<crate::rizin::Session>,
-    pub checkpoints: crate::checkpoint::Store,
+    /// Shared with subagents: their edits checkpoint into the same store, so
+    /// `:rewind` covers them and sequence numbers never collide.
+    pub checkpoints: std::sync::Arc<std::sync::Mutex<crate::checkpoint::Store>>,
     pub custom: custom::Registry,
+    /// Tools this agent may call (None = all). Subagents get a role's subset.
+    pub mask: Option<&'static [&'static str]>,
+    /// Spawns subagents (§5.7). None in a subagent: no nesting.
+    pub subagents: Option<std::sync::Arc<crate::agent::Spawner>>,
     /// Session-scoped watches (`monitor` tool); the loop drains their events.
     pub monitors: crate::monitor::Manager,
     pub afk: bool,
@@ -91,6 +98,9 @@ impl Executor {
         if let Some(problem) = &call.malformed {
             anyhow::bail!("{problem}");
         }
+        if self.toolbox.mask.is_some_and(|m| !m.contains(&call.name.as_str())) {
+            anyhow::bail!("{} is not available to this agent", call.name);
+        }
         match call.name.as_str() {
             "read" => fs::read(&mut self.toolbox, &call.arguments).await,
             "write" => fs::write(&mut self.toolbox, &call.arguments, ui).await,
@@ -104,6 +114,7 @@ impl Executor {
             "code_intel" => intel::run(&mut self.toolbox, &call.arguments).await,
             "ask_user" => ask::run(&self.toolbox, &call.arguments, ui).await,
             "monitor" => monitor::run(&mut self.toolbox, &call.arguments, ui).await,
+            "agent" => agent::run(&mut self.toolbox, &call.arguments, ui).await,
             other => custom::run(&mut self.toolbox, other, &call.arguments).await,
         }
     }
@@ -158,6 +169,11 @@ fn is_inspection(segment: &str) -> bool {
 /// One-line gist of a call for the ToolStarted transcript line.
 fn summarize(call: &ToolCall) -> String {
     let a = &call.arguments;
+    if call.name == "agent" {
+        let role = a.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+        let brief: String = a.get("brief").and_then(|v| v.as_str()).unwrap_or("").lines().next().unwrap_or("").chars().take(70).collect();
+        return format!("{role}: {brief}");
+    }
     let candidates = [
         a.pointer("/steps/0/command"),
         a.pointer("/reads/0/file"),
@@ -180,9 +196,18 @@ fn summarize(call: &ToolCall) -> String {
 }
 
 /// Built-in schemas + custom registry entries, in a stable order for the
-/// cacheable prefix (§8.4). Descriptions stay terse — they're token-billed
-/// on every request; the system prompt carries the behavioral rules.
-pub fn schemas(custom: &custom::Registry) -> Vec<ToolSchema> {
+/// cacheable prefix (§8.4), filtered to `mask` for subagents. Descriptions
+/// stay terse — they're token-billed on every request; the system prompt
+/// carries the behavioral rules.
+pub fn schemas(custom: &custom::Registry, mask: Option<&[&str]>) -> Vec<ToolSchema> {
+    let mut all = all_schemas(custom);
+    if let Some(mask) = mask {
+        all.retain(|s| mask.contains(&s.name.as_str()));
+    }
+    all
+}
+
+fn all_schemas(custom: &custom::Registry) -> Vec<ToolSchema> {
     use serde_json::json;
     let mut out = vec![
         ToolSchema {
@@ -331,6 +356,21 @@ pub fn schemas(custom: &custom::Registry) -> Vec<ToolSchema> {
                 "required":["question"]}),
         },
         ToolSchema {
+            name: "agent".into(),
+            description: "Delegate to a subagent with a fresh context; you get back only its \
+                          report. Roles: explore (read-only research across many files: where \
+                          is X, how does Y work), review (read-only critique of a change against \
+                          a spec), worker (full tools: implement a well-specified, self-contained \
+                          piece). The brief must stand alone — the child knows nothing of this \
+                          conversation. Use for research spanning 10+ files or independent \
+                          pieces of work; not for small tasks or work that chains."
+                .into(),
+            parameters: json!({"type":"object","properties":{
+                "role":{"enum":["explore","review","worker"]},
+                "brief":{"type":"string"}},
+                "required":["role","brief"]}),
+        },
+        ToolSchema {
             name: "monitor".into(),
             description: "Wait without polling: arm a watch, end your turn, and you are woken \
                           when it fires — files changing under the project (watch:\"paths\"), or a \
@@ -378,6 +418,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_masked_toolbox_refuses_tools_outside_its_role() {
+        let dir = testutil::tmp("mask");
+        let (mut toolbox, ui, _rx) = testutil::toolbox(&dir);
+        toolbox.mask = Some(&["read", "search"]);
+        let mut executor = Executor { toolbox };
+        let call = ToolCall {
+            id: "c".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"file": "x.txt", "content": "no"}),
+            malformed: None,
+        };
+        let results = executor.run_batch(vec![call], &ui).await.unwrap();
+        assert!(matches!(&results[0], Message::ToolResult { is_error: true, content, .. } if content.contains("not available to this agent")));
+        assert!(!dir.join("x.txt").exists());
+        // Schemas shrink to the mask; the agent tool itself is never in a child's set.
+        let names: Vec<String> = schemas(&custom::Registry { entries: vec![] }, Some(&["read", "search"])).into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["read".to_string(), "search".to_string()]);
+        assert!(schemas(&custom::Registry { entries: vec![] }, None).iter().any(|s| s.name == "agent"));
+        assert!(crate::agent::Role::parse("worker").is_ok() && crate::agent::Role::parse("boss").is_err());
+    }
+
+    #[tokio::test]
     async fn a_malformed_call_is_answered_with_its_problem_and_never_runs() {
         let dir = testutil::tmp("malformed");
         let (toolbox, ui, _rx) = testutil::toolbox(&dir);
@@ -414,8 +476,10 @@ pub(crate) mod testutil {
             lsp: crate::lsp::Manager::new(dir.to_path_buf(), Default::default(), sandbox.clone()),
             debugger: None,
         rizin: None,
-            checkpoints: crate::checkpoint::Store::open(dir, uuid::Uuid::now_v7()).unwrap(),
+            checkpoints: std::sync::Arc::new(std::sync::Mutex::new(crate::checkpoint::Store::open(dir, uuid::Uuid::now_v7()).unwrap())),
             custom: custom::Registry { entries: vec![] },
+            mask: None,
+            subagents: None,
             monitors: crate::monitor::Manager::new(sandbox.clone()).0,
             sandbox,
             afk: false,

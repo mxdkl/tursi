@@ -21,6 +21,7 @@ use crate::sandbox::{OnError, Step, Streams};
 use crate::stats::{self, BudgetStatus, Ledger};
 use crate::syscard::SystemCard;
 use crate::tools::{self, Executor, Toolbox, custom, fs};
+use std::sync::{Arc, Mutex};
 
 /// Turns an edit may go unexercised before the loop proactively nudges the
 /// model to run it (§5.3) — earlier than the at-done gate, so a task that never
@@ -39,6 +40,7 @@ pub fn build(
     card: &SystemCard,
     session_id: Uuid,
     sandbox: crate::sandbox::Sandbox,
+    secrets: crate::config::Secrets,
     afk: bool,
     headless: bool,
     // Reattaching: restore the persisted transcript before anything runs.
@@ -48,22 +50,6 @@ pub fn build(
     cancel_rx: watch::Receiver<bool>,
 ) -> Result<AgentLoop> {
     let (monitors, monitor_rx) = crate::monitor::Manager::new(sandbox.clone());
-    let toolbox = Toolbox {
-        agent: ROOT,
-        project: project.clone(),
-        fs: fs::State::default(),
-        lsp: crate::lsp::Manager::new(project.clone(), config.lsp.clone(), sandbox.clone()),
-        sandbox,
-        debugger: None,
-        rizin: None,
-        checkpoints: crate::checkpoint::Store::open(&project, session_id)?,
-        custom: custom::Registry::load()?,
-        monitors,
-        afk,
-        lsp_check_edits: config.lsp_check_edits,
-        task: 0,
-        turn: 0,
-    };
     let prefix = prompt::prefix(
         card,
         &prompt::ProjectBlock {
@@ -73,6 +59,36 @@ pub fn build(
             headless,
         },
     );
+    let checkpoints = Arc::new(Mutex::new(crate::checkpoint::Store::open(&project, session_id)?));
+    let spawner = Arc::new(Spawner {
+        project: project.clone(),
+        config: config.clone(),
+        secrets,
+        prefix: prefix.clone(),
+        session: session_id,
+        sandbox: sandbox.clone(),
+        checkpoints: checkpoints.clone(),
+        cancel: cancel_rx.clone(),
+        next_id: std::sync::atomic::AtomicU32::new(1),
+    });
+    let toolbox = Toolbox {
+        agent: ROOT,
+        project: project.clone(),
+        fs: fs::State::default(),
+        lsp: crate::lsp::Manager::new(project.clone(), config.lsp.clone(), sandbox.clone()),
+        sandbox,
+        debugger: None,
+        rizin: None,
+        checkpoints,
+        custom: custom::Registry::load()?,
+        mask: None,
+        subagents: Some(spawner),
+        monitors,
+        afk,
+        lsp_check_edits: config.lsp_check_edits,
+        task: 0,
+        turn: 0,
+    };
     let mut agent = AgentLoop::new(
         ROOT,
         session_id,
@@ -149,6 +165,159 @@ pub struct AgentLoop {
     /// Bounded count of run-before-done nudges — shared by the proactive
     /// (mid-loop) and the at-done gate, so a task can't be nudged forever (§5.3).
     run_nudges: u32,
+}
+
+/// Subagent roles (§5.7). Explore and review are read-only; a worker edits
+/// through the shared checkpoint store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Explore,
+    Review,
+    Worker,
+}
+
+const READ_ONLY_TOOLS: &[&str] = &["read", "search", "code_intel", "log_search"];
+const WORKER_TOOLS: &[&str] =
+    &["read", "write", "edit", "search", "execute_command", "profile", "debug", "rizin", "code_intel", "log_search"];
+
+impl Role {
+    pub fn parse(s: &str) -> Result<Role> {
+        match s {
+            "explore" => Ok(Role::Explore),
+            "review" => Ok(Role::Review),
+            "worker" => Ok(Role::Worker),
+            other => anyhow::bail!("unknown role {other:?} — explore, review, or worker"),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Explore => "explore",
+            Role::Review => "review",
+            Role::Worker => "worker",
+        }
+    }
+
+    fn tools(self) -> &'static [&'static str] {
+        match self {
+            Role::Explore | Role::Review => READ_ONLY_TOOLS,
+            Role::Worker => WORKER_TOOLS,
+        }
+    }
+
+    /// Appended to the prefix: what this child is for and how to report.
+    fn addendum(self) -> &'static str {
+        match self {
+            Role::Explore => "## Role: explore (subagent)\nYou are a read-only research subagent. Answer the brief from the code: \
+                cite files and line numbers, quote the decisive lines, and state what you could not \
+                determine. Your final message is the whole report the parent agent gets — complete, \
+                specific, no preamble, no suggestions to run things you cannot run.",
+            Role::Review => "## Role: review (subagent)\nYou are a read-only review subagent. Judge the change the brief describes \
+                against its intent: correctness first, then missed cases, then style. Cite files and \
+                lines. Your final message is the whole report the parent agent gets: findings ordered \
+                by severity, each with location and why it matters; say plainly if it looks right.",
+            Role::Worker => "## Role: worker (subagent)\nYou implement the brief, completely and nothing more, in this project. Run \
+                what you change. Your final message is the whole report the parent agent gets: what \
+                you changed (files), what you ran and the result, and anything the brief left open.",
+        }
+    }
+}
+
+/// What a subagent needs that its parent has: config, credentials, the
+/// prefix, the sandbox, the shared checkpoint store, the parent's cancel.
+pub struct Spawner {
+    project: PathBuf,
+    config: Config,
+    secrets: crate::config::Secrets,
+    prefix: String,
+    session: Uuid,
+    sandbox: crate::sandbox::Sandbox,
+    checkpoints: Arc<Mutex<crate::checkpoint::Store>>,
+    cancel: watch::Receiver<bool>,
+    next_id: std::sync::atomic::AtomicU32,
+}
+
+/// Longest report handed back; the child's full transcript is persisted.
+const REPORT_CAP: usize = 6000;
+
+impl Spawner {
+    /// Run one subagent to completion and return its report. The child's
+    /// events reach the UI under its own agent id (collapsed by default).
+    pub async fn run(&self, role: Role, brief: String, parent_ui: &UiHandle) -> Result<String> {
+        let n = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = AgentId(n);
+        let settings = self.config.agents.get(role.name()).cloned().unwrap_or_default();
+        let mut config = self.config.clone();
+        if let Some(model) = settings.model {
+            config.model = model;
+            config.fallbacks.clear();
+        }
+        config.max_turns_per_task = settings.max_turns.unwrap_or(30);
+        config.verify.clear(); // the parent owns verification
+        let provider = Provider::for_model(&config.model, &self.secrets)?;
+
+        let (monitors, _monitor_rx) = crate::monitor::Manager::new(self.sandbox.clone());
+        let toolbox = Toolbox {
+            agent: id,
+            project: self.project.clone(),
+            fs: fs::State::default(),
+            lsp: crate::lsp::Manager::new(self.project.clone(), config.lsp.clone(), self.sandbox.clone()),
+            sandbox: self.sandbox.clone(),
+            debugger: None,
+            rizin: None,
+            checkpoints: self.checkpoints.clone(),
+            custom: custom::Registry { entries: vec![] },
+            mask: Some(role.tools()),
+            subagents: None,
+            monitors,
+            afk: true,
+            lsp_check_edits: config.lsp_check_edits,
+            task: 0,
+            turn: 0,
+        };
+        let (_steer_tx, steer_rx) = mpsc::channel(1);
+        let ui = UiHandle { agent: id, tx: parent_ui.tx.clone() };
+        let mut child = AgentLoop::new(
+            id,
+            self.session,
+            format!("{}\n{}\n", self.prefix, role.addendum()),
+            config,
+            Executor { toolbox },
+            Ledger::open()?,
+            ui,
+            steer_rx,
+            self.cancel.clone(),
+        );
+        child.afk = true;
+        let started = std::time::Instant::now();
+        // The loop recurses through the tool call: box the child's future.
+        let outcome = Box::pin(child.run_task(&provider, brief)).await;
+        child.persist_as(&format!("agent-{n}"));
+        let last_text = child
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                Message::Assistant { text, .. } if !text.trim().is_empty() => Some(text.trim().to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut report = match outcome? {
+            TaskOutcome::Done { summary } | TaskOutcome::NeedsUser { text: summary } => {
+                if summary.trim().is_empty() { last_text } else { summary }
+            }
+            TaskOutcome::Interrupted => format!("(interrupted)\n{last_text}"),
+            TaskOutcome::TurnLimit => format!("(turn limit reached before the brief was finished; last state:)\n{last_text}"),
+            TaskOutcome::BudgetHalt => format!("(budget cap reached)\n{last_text}"),
+        };
+        if report.len() > REPORT_CAP {
+            let cut = report.char_indices().nth(REPORT_CAP).map(|(i, _)| i).unwrap_or(report.len());
+            report.truncate(cut);
+            report.push_str("\n… (report truncated)");
+        }
+        tracing::info!(agent = n, role = role.name(), secs = started.elapsed().as_secs(), "subagent finished");
+        Ok(format!("[{} agent-{n}, {}s]\n{report}", role.name(), started.elapsed().as_secs()))
+    }
 }
 
 pub enum TaskOutcome {
@@ -287,7 +456,7 @@ impl AgentLoop {
                     self.ui.send(EventKind::TaskDone { summary }).await;
                 }
                 Command::Rewind(n) => {
-                    let summary = match self.executor.toolbox.checkpoints.rewind(n) {
+                    let summary = match self.executor.toolbox.checkpoints.lock().unwrap().rewind(n) {
                         Ok(files) if files.is_empty() => "nothing to rewind".to_string(),
                         Ok(files) => format!(
                             "rewound {} file(s): {}",
@@ -346,7 +515,17 @@ impl AgentLoop {
     /// after every turn, so `--resume` has the latest. Best-effort: a write
     /// failure is logged, never fatal.
     fn persist(&self) {
-        let path = crate::session::Session::transcript_path(&self.executor.toolbox.project, self.session);
+        self.persist_to(crate::session::Session::transcript_path(&self.executor.toolbox.project, self.session));
+    }
+
+    /// A subagent's transcript, beside the session's: `<session>.agent-N.transcript.json`.
+    fn persist_as(&self, suffix: &str) {
+        let base = crate::session::Session::transcript_path(&self.executor.toolbox.project, self.session);
+        let name = format!("{}.{suffix}.transcript.json", self.session);
+        self.persist_to(base.with_file_name(name));
+    }
+
+    fn persist_to(&self, path: PathBuf) {
         let doc = serde_json::json!({ "task": self.task, "messages": self.transcript });
         let tmp = path.with_extension("json.tmp");
         let write = || {
@@ -563,7 +742,7 @@ impl AgentLoop {
         let mut messages = Vec::with_capacity(self.transcript.len() + 1);
         messages.push(Message::System(self.prefix.clone()));
         messages.extend(self.transcript.iter().cloned());
-        let schemas = tools::schemas(&self.executor.toolbox.custom);
+        let schemas = tools::schemas(&self.executor.toolbox.custom, self.executor.toolbox.mask);
 
         let mut model = self.router.model().to_string();
         let mut attempt = 0u32;
@@ -725,7 +904,7 @@ impl AgentLoop {
     /// Crude estimate (bytes/4) of what each request sends: the prefix, the
     /// tool schemas, and the transcript — fine for the compaction trigger.
     fn context_tokens(&self) -> u64 {
-        let schemas = serde_json::to_string(&tools::schemas(&self.executor.toolbox.custom))
+        let schemas = serde_json::to_string(&tools::schemas(&self.executor.toolbox.custom, self.executor.toolbox.mask))
             .map_or(0, |s| s.len());
         let transcript: usize = self
             .transcript

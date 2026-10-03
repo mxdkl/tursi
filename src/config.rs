@@ -49,6 +49,10 @@ pub struct Config {
     /// Hosts reachable from the sandbox without asking, on top of the package
     /// registries (PERMISSIONS.md §4). `host`, `.suffix`, or `host:port`.
     pub network: NetworkConfig,
+    /// Per-role subagent settings (§5.7): `[agents.explore] model = "…"`.
+    /// A role not listed inherits the parent's model; `max_turns` defaults
+    /// to 30.
+    pub agents: HashMap<String, AgentConfig>,
     /// Context fraction that triggers compaction (§8).
     pub compact_at: f32,
     /// The model's context window in tokens — the compaction denominator.
@@ -86,6 +90,7 @@ impl Default for Config {
             typecheck: Vec::new(),
             sandbox: SandboxConfig::default(),
             network: NetworkConfig::default(),
+            agents: HashMap::new(),
             compact_at: 0.75,
             context_window: crate::agent::prompt::DEFAULT_CONTEXT_WINDOW,
             compact_min_tokens: 24_000,
@@ -93,6 +98,13 @@ impl Default for Config {
             lsp_check_edits: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub model: Option<String>,
+    pub max_turns: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -186,6 +198,12 @@ cached_input = 0.044  # cache hit
 # [network]
 # allow = ["github.com"]
 
+# Subagents (explore / review / worker) run on the main model unless a role
+# names its own. Cheap-output models suit the read-heavy roles.
+# [agents.explore]
+# model = "deepseek/deepseek-flash"
+# max_turns = 30
+
 # Per-project .tursi/config.toml can override:
 #   verify    = ["cargo check", "cargo test"]   # AFK gate (SPEC §5.3)
 #   typecheck = ["cargo check"]                 # plan gate (SPEC §5.5)
@@ -261,6 +279,7 @@ impl Config {
 
 /// API keys and provider base URLs, split from config so `tar ~/.tursi`
 /// is safe (§1). Values are literal or `env:VAR_NAME` indirection.
+#[derive(Clone)]
 pub struct Secrets {
     keys: HashMap<String, String>,
     base_urls: HashMap<String, String>,

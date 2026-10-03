@@ -179,7 +179,7 @@ pub async fn write(tb: &mut Toolbox, args: &Value, ui: &UiHandle) -> Result<Stri
         String::new()
     };
 
-    tb.checkpoints.snapshot(tb.task, &path)?;
+    tb.checkpoints.lock().unwrap().snapshot(tb.task, &path)?;
     std::fs::write(&path, &args.content)?;
     ui.send(EventKind::FileDiff(crate::diff::diff(&args.file.display().to_string(), &old, &args.content))).await;
     let hash = blake3::hash(args.content.as_bytes());
@@ -293,9 +293,9 @@ async fn apply_file_transaction(tb: &mut Toolbox, file: &PathBuf, hunks: Vec<Hun
     }
 
     let new_hash = blake3::hash(work.as_bytes());
-    let oscillated = tb.checkpoints.seen(tb.task, &path, new_hash);
+    let oscillated = tb.checkpoints.lock().unwrap().seen(tb.task, &path, new_hash);
 
-    tb.checkpoints.snapshot(tb.task, &path)?;
+    tb.checkpoints.lock().unwrap().snapshot(tb.task, &path)?;
     std::fs::write(&path, &work)?;
     ui.send(EventKind::FileDiff(crate::diff::diff(&file.display().to_string(), &original, &work))).await;
     tb.fs.reads.insert(
@@ -399,8 +399,10 @@ mod tests {
             lsp: crate::lsp::Manager::new(dir.to_path_buf(), Default::default(), sandbox.clone()),
             debugger: None,
         rizin: None,
-            checkpoints: crate::checkpoint::Store::open(dir, uuid::Uuid::now_v7()).unwrap(),
+            checkpoints: std::sync::Arc::new(std::sync::Mutex::new(crate::checkpoint::Store::open(dir, uuid::Uuid::now_v7()).unwrap())),
             custom: crate::tools::custom::Registry { entries: vec![] },
+            mask: None,
+            subagents: None,
             monitors: crate::monitor::Manager::new(sandbox.clone()).0,
             afk: false,
             lsp_check_edits: false,

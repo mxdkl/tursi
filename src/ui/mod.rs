@@ -112,6 +112,7 @@ pub async fn run(
         &card,
         session.id,
         sandbox,
+        secrets.clone(),
         afk,
         false,
         session.resumed,
@@ -264,13 +265,34 @@ impl App {
         self.set_status("interrupting — waiting for the loop to unwind…");
     }
 
-    /// Apply one agent event to the view.
+    /// Apply one agent event to the view. A subagent's events (§5.7) fold
+    /// into the parent's `agent` entry as a trace; nothing else of theirs is
+    /// shown unless the user expands it.
     pub fn apply_event(&mut self, event: UiEvent) {
+        if event.agent != ROOT {
+            let line = match event.kind {
+                EventKind::ToolStarted { name, summary } => format!("{name} {summary}"),
+                EventKind::ToolFinished { name, content, is_error } if is_error => {
+                    format!("✗ {name}: {}", content.lines().next().unwrap_or(""))
+                }
+                EventKind::TaskDone { summary } => format!("done: {}", summary.lines().next().unwrap_or("")),
+                _ => return,
+            };
+            if let Some(Entry::Tool { trace, .. }) = self
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|e| matches!(e, Entry::Tool { name, result: None, .. } if name == "agent"))
+            {
+                trace.push(line);
+            }
+            return;
+        }
         match event.kind {
             EventKind::AgentText(delta) => self.partial.push_str(&delta),
             EventKind::ToolStarted { name, summary } => {
                 self.flush_partial();
-                self.transcript.push(Entry::Tool { name, summary, result: None });
+                self.transcript.push(Entry::Tool { name, summary, result: None, trace: Vec::new() });
             }
             EventKind::ToolFinished { name, content, is_error } => {
                 // Results land on the newest unanswered call with that name.
@@ -280,7 +302,7 @@ impl App {
                 });
                 match slot {
                     Some(result) => *result = Some(ToolResult { content, is_error }),
-                    None => self.transcript.push(Entry::Tool { name, summary: String::new(), result: Some(ToolResult { content, is_error }) }),
+                    None => self.transcript.push(Entry::Tool { name, summary: String::new(), result: Some(ToolResult { content, is_error }), trace: Vec::new() }),
                 }
             }
             EventKind::FileDiff(diff) => self.transcript.push(Entry::Diff(diff)),
