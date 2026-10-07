@@ -33,9 +33,9 @@ pub enum Mode {
 
 pub async fn run(tb: &mut Toolbox, args: &Value) -> Result<String> {
     let args: ProfileArgs = serde_json::from_value(args.clone())?;
-    shell::validate_step(&args.command, tb.sandbox.bash)?;
+    shell::validate_step(&args.command, &tb.sandbox.shell, tb.sandbox.bash)?;
     if let Some(baseline) = &args.baseline {
-        shell::validate_step(baseline, tb.sandbox.bash)?;
+        shell::validate_step(baseline, &tb.sandbox.shell, tb.sandbox.bash)?;
     }
 
     match args.mode {

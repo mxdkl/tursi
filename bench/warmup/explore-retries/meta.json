@@ -1,0 +1,7 @@
+{
+ "activity": "research",
+ "domain": "backend",
+ "difficulty": 1.47,
+ "protect": [],
+ "prompt": "Read-only question about this project; do not change any files. How many times does the HTTP client retry a failed request by default, and which file and function set that default? Answer with the number and file:function."
+}

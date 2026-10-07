@@ -40,6 +40,8 @@ pub enum What {
     Exited { code: Option<i32>, tail: String },
     /// Timed out; the monitor is gone.
     TimedOut { after: Duration },
+    /// A background job (a subagent) finished with this report; gone.
+    Report { text: String },
 }
 
 impl Event {
@@ -47,6 +49,7 @@ impl Event {
     pub fn render(&self) -> String {
         let head = format!("[monitor {} {}]", self.id, self.label);
         match &self.what {
+            What::Report { text } => format!("[{} {} finished]\n{text}", self.id, self.label),
             What::Files { created, modified, deleted } => {
                 let mut parts = Vec::new();
                 for (verb, list) in [("created", created), ("modified", modified), ("deleted", deleted)] {
@@ -92,12 +95,20 @@ pub struct Manager {
     next: u32,
     events: mpsc::Sender<Event>,
     sandbox: Sandbox,
+    /// Whose monitors these are: their output is credited to this agent.
+    agent: crate::bus::AgentId,
 }
 
 impl Manager {
     pub fn new(sandbox: Sandbox) -> (Manager, mpsc::Receiver<Event>) {
         let (tx, rx) = mpsc::channel(64);
-        (Manager { armed: HashMap::new(), next: 1, events: tx, sandbox }, rx)
+        (Manager { armed: HashMap::new(), next: 1, events: tx, sandbox, agent: crate::bus::ROOT }, rx)
+    }
+
+    /// A subagent's monitors: their output is credited to it.
+    pub fn for_agent(mut self, agent: crate::bus::AgentId) -> Manager {
+        self.agent = agent;
+        self
     }
 
     /// `(id, label, kind)` of each armed monitor.
@@ -120,6 +131,18 @@ impl Manager {
     /// Drop a monitor that ended on its own (exit/timeout) from the list.
     pub fn forget(&mut self, id: &str) {
         self.armed.remove(id);
+    }
+
+    /// Run `job` in the background under `id` (listed like a monitor, so the
+    /// loop knows work is pending); its text arrives as a `Report` event.
+    /// Jobs don't count against the monitor cap.
+    pub fn spawn_job(&mut self, id: String, label: String, kind: &str, job: impl std::future::Future<Output = String> + Send + 'static) {
+        let (events, id2, label2) = (self.events.clone(), id.clone(), label.clone());
+        let task = tokio::spawn(async move {
+            let text = job.await;
+            let _ = events.send(Event { id: id2, label: label2, what: What::Report { text } }).await;
+        });
+        self.armed.insert(id, Armed { label, kind: kind.to_string(), task });
     }
 
     fn reserve(&mut self, label: &str, kind: &str) -> Result<String> {
@@ -168,8 +191,17 @@ impl Manager {
     /// Run `command` in the sandbox and wake on its output lines (batched)
     /// and its exit. With `quiet`, only the exit wakes — with an error-aware
     /// tail of everything it printed (background builds and test runs).
-    pub async fn watch_command(&mut self, command: String, label: String, timeout: Option<Duration>, quiet: bool) -> Result<String> {
-        crate::shell::validate_step(&command, self.sandbox.bash)?;
+    /// `watch` (shell-made changes, §3.3) lives as long as the command's
+    /// task: the changes it makes are credited to the agent that ran it.
+    pub async fn watch_command(
+        &mut self,
+        command: String,
+        label: String,
+        timeout: Option<Duration>,
+        quiet: bool,
+        watch: Option<crate::changes::Watch>,
+    ) -> Result<String> {
+        crate::shell::validate_step(&command, &self.sandbox.shell, self.sandbox.bash)?;
         let id = self.reserve(&label, if quiet { "background" } else { "command" })?;
         let argv = vec![self.sandbox.shell.clone(), "-c".to_string(), command.clone()];
         let mut child = self
@@ -178,8 +210,9 @@ impl Manager {
             .await?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
-        let (events, id2, label2, project, agent) = (self.events.clone(), id.clone(), label.clone(), self.sandbox.project.clone(), crate::bus::ROOT);
+        let (events, id2, label2, project, agent) = (self.events.clone(), id.clone(), label.clone(), self.sandbox.project.clone(), self.agent);
         let task = tokio::spawn(async move {
+            let _watch = watch;
             let started = Instant::now();
             let (line_tx, mut line_rx) = mpsc::channel::<String>(256);
             for stream in [stdout, stderr] {
@@ -314,6 +347,19 @@ fn wildcard(pattern: &str, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn a_background_job_is_listed_until_its_report_arrives() {
+        let dir = testutil::tmp("monitor-job");
+        let (mut m, mut rx) = Manager::new(Sandbox::for_tests(&dir));
+        m.spawn_job("agent-7".into(), "writer add greet".into(), "agent", async { "all done".to_string() });
+        assert_eq!(m.list(), vec![("agent-7".to_string(), "writer add greet".to_string(), "agent".to_string())]);
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(event.id, "agent-7");
+        assert_eq!(event.render(), "[agent-7 writer add greet finished]\nall done");
+        m.forget(&event.id);
+        assert!(m.list().is_empty());
+    }
     use super::*;
     use crate::tools::testutil;
 
@@ -346,11 +392,8 @@ mod tests {
     async fn a_command_monitor_batches_lines_and_reports_exit() {
         let dir = testutil::tmp("mon-cmd");
         let (mut m, mut rx) = Manager::new(Sandbox::for_tests(&dir));
-        let id = m.watch_command("echo one; echo two; sleep 0.2; echo three".into(), "build".into(), None, false).await;
-        // `;` is rejected like any step: use a script file instead.
-        assert!(id.is_err(), "chaining is rejected");
         std::fs::write(dir.join("run.sh"), "echo one\necho two\nsleep 0.3\necho three\nexit 3\n").unwrap();
-        let id = m.watch_command("sh run.sh".into(), "build".into(), None, false).await.unwrap();
+        let id = m.watch_command("sh run.sh".into(), "build".into(), None, false, None).await.unwrap();
         let first = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
         assert!(matches!(&first.what, What::Output { lines, .. } if lines.len() >= 2 && lines[0] == "one"), "{first:?}");
         let mut saw_exit = false;
@@ -372,7 +415,7 @@ mod tests {
         let dir = testutil::tmp("mon-quiet");
         let (mut m, mut rx) = Manager::new(Sandbox::for_tests(&dir));
         std::fs::write(dir.join("build.sh"), "echo compiling\necho error[E0308]: mismatched types\nexit 101\n").unwrap();
-        let id = m.watch_command("sh build.sh".into(), "cargo build".into(), None, true).await.unwrap();
+        let id = m.watch_command("sh build.sh".into(), "cargo build".into(), None, true, None).await.unwrap();
         let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
         let text = ev.render();
         assert!(text.starts_with(&format!("[monitor {id} cargo build] FAILED: exit 101")), "{text}");

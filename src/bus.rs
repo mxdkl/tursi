@@ -27,13 +27,14 @@ pub enum EventKind {
     ToolStarted { name: String, summary: String },
     /// The full result; the TUI collapses it (Ctrl+O expands).
     ToolFinished { name: String, content: String, is_error: bool },
-    /// What an edit/write changed, for the transcript's diff view.
-    FileDiff(crate::diff::FileDiff),
     /// The one permission prompt: full network for a call (PERMISSIONS.md §4.3).
     Approval(ApprovalRequest),
     /// ask_user overlay (§4.4).
     Ask(AskRequest),
     Cost { session_usd: f64, month_usd: f64 },
+    /// The provider's prepaid balance, in dollars — what the footer shows
+    /// instead of the harness's own cost arithmetic.
+    Balance { usd: f64 },
     /// Context-window usage for the header gauge: estimated transcript tokens
     /// and the window size (§8).
     Context { used_tokens: u64, window: u64 },
@@ -46,6 +47,15 @@ pub enum EventKind {
     MonitorWoke { text: String },
     /// Armed monitors `(id, label)`, for the status bar.
     Monitors { armed: Vec<(String, String)> },
+    /// The goal's state for the status bar: None when no goal is active.
+    Goal { condition: Option<String>, turns: u32, last_reason: Option<String> },
+    /// One evaluator verdict, shown in the transcript.
+    GoalVerdict { verdict: String, reason: String },
+    /// A subagent began work (sent under its own id): its tile appears.
+    /// `continued`: a follow-up brief to an agent that already has a tile.
+    SubagentStarted { access: String, title: String, model: String, continued: bool },
+    /// A subagent's run ended (its tile closes; the report goes to the lead).
+    SubagentFinished { ok: bool },
 }
 
 pub struct ApprovalRequest {

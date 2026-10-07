@@ -1,0 +1,29 @@
+--- a/cache.py
++++ b/cache.py
+@@ -1,10 +1,13 @@
++import time
++
++
+ class Cache:
+-    """A dict."""
++    """A dict whose entries expire after `ttl` seconds."""
+
+-    def __init__(self):
++    def __init__(self, ttl):
++        self.ttl = ttl
+         self.items = {}
+
+     def put(self, key, value):
+-        self.items[key] = value
++        self.items[key] = (value, time.monotonic())
+
+     def get(self, key, default=None):
+-        return self.items.get(key, default)
++        entry = self.items.get(key)
++        if entry is None:
++            return default
++        value, stored = entry
++        if time.monotonic() - stored < self.ttl:
++            del self.items[key]
++            return default
++        return value

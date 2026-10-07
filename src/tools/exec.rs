@@ -52,6 +52,28 @@ fn valid_env_key(k: &str) -> bool {
         && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Shadow risk gate: ask the decision model whether this call should have
+/// gone through `ask_user` first, and log the answer. Nothing is blocked —
+/// this collects the calibration data for a real gate later.
+fn shadow_gate(tb: &Toolbox, args: &ExecArgs) {
+    let Some(decider) = &tb.decider else { return };
+    use crate::decide::Question;
+    let commands: Vec<&str> = args.steps.iter().map(|s| s.command.as_str()).collect();
+    let state = serde_json::json!({
+        "context": "An autonomous coding agent is about to run these commands in a developer's project, in order.",
+        "commands": commands,
+    });
+    let questions = vec![(
+        "destructive".to_string(),
+        Question::noul(
+            "Would running these commands be destructive or irreversible in a way the agent should ask the \
+             user about first (deleting files or data outside build artifacts, migrations, rewriting history, \
+             force operations, removing tests)? Installing dependencies, building, and running tests do not count.",
+        ),
+    )];
+    decider.shadow_ask("command_risk", commands.join(" ; ").chars().take(120).collect(), state, questions);
+}
+
 /// Parse → validate (chaining ban) → the network prompt if a step asks for
 /// it (PERMISSIONS.md §4.3) → run in one shell → render one line per step.
 pub async fn run(tb: &mut Toolbox, args: &Value, ui: &UiHandle) -> Result<String> {
@@ -60,7 +82,7 @@ pub async fn run(tb: &mut Toolbox, args: &Value, ui: &UiHandle) -> Result<String
         bail!("no steps given");
     }
     for step in &args.steps {
-        shell::validate_step(&step.command, tb.sandbox.bash)?;
+        shell::validate_step(&step.command, &tb.sandbox.shell, tb.sandbox.bash)?;
     }
     let full_network = args.steps.iter().any(|s| s.network.as_deref() == Some("full"));
     for step in &args.steps {
@@ -68,6 +90,7 @@ pub async fn run(tb: &mut Toolbox, args: &Value, ui: &UiHandle) -> Result<String
             bail!("unknown network value {other:?} — only \"full\" is accepted");
         }
     }
+    shadow_gate(tb, &args);
     let background = args.background.unwrap_or(false) || args.steps.iter().any(|s| s.background.unwrap_or(false));
     if background && full_network {
         bail!("background calls can't take `network: \"full\"` — the grant lasts one foreground call");
@@ -85,9 +108,22 @@ pub async fn run(tb: &mut Toolbox, args: &Value, ui: &UiHandle) -> Result<String
         return self::background(tb, &args, &steps, ui).await;
     }
     tb.sandbox.grant_network(full_network);
+    // Shell-made changes (§3.3): the tree before and after this command. A
+    // lead's commands see the project read-only, so they change nothing.
+    let commands: Vec<&str> = args.steps.iter().map(|s| s.command.as_str()).collect();
+    let watch = Some(crate::changes::watch(&tb.changes, tb.agent, tb.task, &commands.join(" ; ")));
     let results = tb.sandbox.run_steps(steps.clone(), parse_on_error(&args)?).await;
+    drop(watch);
     tb.sandbox.grant_network(false);
-    let mut out = render(tb, &steps, &results?)?;
+    let results = results?;
+    let mut out = render(tb, &steps, &results)?;
+    let read_only_hit = results.iter().any(|r| r.stderr.contains("Read-only file system") || r.stdout.contains("Read-only file system"));
+    if read_only_hit && tb.writes.as_ref().is_some_and(Vec::is_empty) {
+        out.push_str(
+            "\n[read-only] You were given no write areas, so the project is read-only to you. Build or scratch \
+             elsewhere (/tmp), and put any change the brief needs in your report.",
+        );
+    }
     let blocked = tb.sandbox.blocked_hosts();
     if !blocked.is_empty() {
         out.push_str(&format!(
@@ -132,9 +168,12 @@ async fn background(tb: &mut Toolbox, args: &ExecArgs, steps: &[Step], ui: &UiHa
     let name = format!("bg-{}.sh", uuid::Uuid::now_v7().simple());
     let path = tb.sandbox.scratch_file(&name, &script)?;
     let timeout = Some(steps.iter().map(|s| s.timeout).sum::<Duration>().max(Duration::from_secs(60)));
+    // Changes the job makes are credited to this agent until it exits.
+    let commands: Vec<&str> = steps.iter().map(|s| s.command.as_str()).collect();
+    let watch = Some(crate::changes::watch(&tb.changes, tb.agent, tb.task, &commands.join(" ; ")));
     let id = tb
         .monitors
-        .watch_command(format!("{} {}", tb.sandbox.shell, crate::sandbox::sh_quote(&path.display().to_string())), label.clone(), timeout, true)
+        .watch_command(format!("{} {}", tb.sandbox.shell, crate::sandbox::sh_quote(&path.display().to_string())), label.clone(), timeout, true, watch)
         .await?;
     ui.send(EventKind::Monitors { armed: tb.monitors.list().into_iter().map(|(id, label, _)| (id, label)).collect() }).await;
     Ok(format!(
@@ -272,6 +311,7 @@ fn render(tb: &Toolbox, steps: &[Step], results: &[StepResult]) -> Result<String
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::tools::testutil;
 
@@ -296,8 +336,8 @@ mod tests {
         assert!(out.contains("exit 1"));
         assert!(out.contains("3 – echo never    not run"));
         assert!(out.contains("[full: log#"));
-        let log = std::fs::read_to_string(dir.join(".tursi/debug.log")).unwrap();
-        assert!(log.contains("execute_command"));
+        let log = crate::ledger::raw(&dir);
+        assert!(log.contains("\"kind\":\"output\"") && log.contains("execute_command"));
     }
 
     #[tokio::test]
@@ -416,16 +456,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chained_commands_are_rejected_before_anything_runs() {
+    async fn steps_are_real_shell_scripts() {
         let dir = testutil::tmp("exec-chain");
         let (mut tb, ui, _rx) = testutil::toolbox(&dir);
-        let err = run(
+        let out = run(
             &mut tb,
-            &serde_json::json!({"steps": [{"command": "echo a && echo b"}]}),
+            &serde_json::json!({"steps": [{"command": "echo a && echo $(echo b); false || echo c"}]}),
             &ui,
         )
         .await
-        .unwrap_err();
-        assert!(err.to_string().contains("use separate steps"));
+        .unwrap();
+        assert!(out.contains('a') && out.contains('b') && out.contains('c'), "{out}");
+        let out = run(&mut tb, &serde_json::json!({"steps": [{"command": "python3 - <<'EOF'\nprint(6*7)\nEOF"}]}), &ui).await.unwrap();
+        assert!(out.contains("42"), "{out}");
+        // What would hang the runner is refused before anything runs.
+        let err = run(&mut tb, &serde_json::json!({"steps": [{"command": "sleep 30 &"}]}), &ui).await.unwrap_err();
+        assert!(err.to_string().contains("background: true"), "{err}");
+        let err = run(&mut tb, &serde_json::json!({"steps": [{"command": "if true; then echo x"}]}), &ui).await.unwrap_err();
+        assert!(err.to_string().contains("syntax error"), "{err}");
     }
 }

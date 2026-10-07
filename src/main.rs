@@ -5,16 +5,21 @@
 
 mod agent;
 mod api;
+mod balance;
 mod bus;
-mod checkpoint;
+mod changes;
 mod config;
 mod dap;
+mod deals;
+mod decide;
 mod diff;
 mod headless;
+mod ledger;
 mod lsp;
 mod monitor;
 mod output;
 mod plan;
+mod ratelimit;
 mod rizin;
 mod router;
 mod sandbox;
@@ -48,9 +53,13 @@ struct Args {
     #[arg(long)]
     check: bool,
     /// Run one task non-interactively (unattended), then exit — for scripting
-    /// and benchmarking (BENCH.md). Implies --afk and AUTO approval.
+    /// and benchmarking (BENCH.md). Implies --afk.
     #[arg(long, value_name = "PROMPT")]
     task: Option<String>,
+    /// Like --task, but keep working until a separate evaluator judges this
+    /// condition met (or impossible) — see `/goal`.
+    #[arg(long, value_name = "CONDITION", conflicts_with = "task")]
+    goal: Option<String>,
     /// With --task, emit metrics as a single JSON line.
     #[arg(long)]
     json: bool,
@@ -58,6 +67,33 @@ struct Args {
     /// bound for unattended/benchmark runs.
     #[arg(long)]
     max_turns: Option<u32>,
+    /// Run on this model instead of the configured one (fallbacks are
+    /// dropped). For comparing models; the model must have a credential.
+    #[arg(long, value_name = "ID")]
+    model: Option<String>,
+    /// Run this model alone with full tools: no subagents, DEALS off. For
+    /// DEALS warm-up runs (bench/deals-warmup.py) and model comparisons.
+    #[arg(long, value_name = "ID", conflicts_with = "model")]
+    station: Option<String>,
+    /// Limit the DEALS pool to these stations for this run (comma-separated
+    /// model ids), e.g. a single-model baseline that still goes through the
+    /// pipeline (§5.8).
+    #[arg(long, value_name = "IDS", conflicts_with = "station")]
+    pool: Option<String>,
+    /// Training runs: explore (`[deals] explore`), and route each new task to
+    /// the least-tried station until every station has N outcomes
+    /// (`[deals] explore_min`, §5.8; 0 explores without coverage).
+    #[arg(long, value_name = "N")]
+    explore_min: Option<u32>,
+    /// Print the labels the decision model gives the brief on stdin (activity,
+    /// domain, difficulty; §5.8) as one JSON line, `{}` when it can't, and
+    /// exit. For building benchmark sets that cover them (bench/coverage.py).
+    #[arg(long)]
+    label: bool,
+    /// List DEALS stations and what each has learned (§5.8); `probe`
+    /// re-reads the provider's model catalog and tool-checks every candidate.
+    #[arg(long, value_name = "probe", num_args = 0..=1, default_missing_value = "list")]
+    stations: Option<String>,
     /// Run commands WITHOUT the sandbox — benchmarks inside a disposable
     /// container only (PERMISSIONS.md §6). Requires --task.
     #[arg(long)]
@@ -67,20 +103,50 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    if args.no_sandbox && args.task.is_none() {
+    if args.no_sandbox && args.task.is_none() && args.goal.is_none() {
         anyhow::bail!(
             "--no-sandbox is for benchmarks inside a disposable container only — it requires --task"
         );
     }
-    let project = project_root(args.project)?;
-    let _log_guard = init_logging(&project)?;
+    // `--stations` and `--label` are about the account, not a project: they
+    // must not plant a `.tursi/` in whatever directory they run from (a stray
+    // one turns every directory below it into part of one project), so they
+    // take no project root and log nowhere. Everything else logs to the
+    // project ledger.
+    let account_only = args.stations.is_some() || args.label;
+    let project = if account_only { std::env::current_dir()? } else { project_root(args.project)? };
+    if !account_only {
+        init_logging();
+    }
     let mut config = config::Config::load(&project)?;
     if let Some(max) = args.max_turns {
         config.max_turns_per_task = max;
     }
+    if let Some(pool) = args.pool.as_deref() {
+        config.deals.stations = pool.split(',').map(str::trim).filter(|m| !m.is_empty()).map(String::from).collect();
+    }
+    if let Some(n) = args.explore_min {
+        config.deals.explore = true;
+        config.deals.explore_min = n;
+    }
     let secrets = config::Secrets::load()?;
     if args.check {
-        return check(&project, &config, &secrets);
+        return check(&project, &config, &secrets).await;
+    }
+    if args.label {
+        use anyhow::Context;
+        let mut brief = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut brief)?;
+        let decider = decide::Decider::from_config(&config, &secrets).context("no decision model ([decide] model)")?;
+        println!("{}", serde_json::to_string(&deals::labels::label(Some(&decider), &brief).await)?);
+        return Ok(());
+    }
+    if let Some(mode) = args.stations.as_deref() {
+        if !matches!(mode, "list" | "probe") {
+            anyhow::bail!("--stations takes nothing or `probe`");
+        }
+        crate::ratelimit::configure(&config.limits, deals::catalog::Catalog::load().stations.iter().filter(|s| s.paid).map(|s| s.model.clone()));
+        return deals::catalog::run_cli(&config, &secrets, mode == "probe").await;
     }
     if args.sessions {
         let list = session::Session::list(&project)?;
@@ -100,6 +166,20 @@ async fn main() -> Result<()> {
         println!("\nresume with: tursi --resume <id-prefix>   (or --resume for the latest)");
         return Ok(());
     }
+    if let Some(model) = args.model.clone() {
+        config.model = model;
+        config.fallbacks.clear();
+    }
+    if let Some(model) = args.station.clone() {
+        if let Some(s) = deals::catalog::Catalog::load().get(&model) {
+            config.prices.entry(model.clone()).or_insert_with(|| s.price());
+            config.models.entry(model.clone()).or_insert_with(|| s.default_options());
+        }
+        config.model = model;
+        config.fallbacks.clear();
+        config.solo = true;
+        config.deals.enabled = false;
+    }
     if config.model.is_empty() {
         anyhow::bail!(
             "no model configured — set `model = \"<provider>/<model>\"` in {}/config.toml",
@@ -110,7 +190,10 @@ async fn main() -> Result<()> {
     let session = session::Session::open_or_resume(&project, args.resume.as_deref())?;
     let sandbox = start_sandbox(&project, &config, session.id, args.no_sandbox)?;
     if let Some(task) = args.task {
-        return headless::run(project, config, secrets, card, session, sandbox, task, args.json).await;
+        return headless::run(project, config, secrets, card, session, sandbox, headless::Job::Task(task), args.json).await;
+    }
+    if let Some(condition) = args.goal {
+        return headless::run(project, config, secrets, card, session, sandbox, headless::Job::Goal(condition), args.json).await;
     }
     ui::run(project, config, secrets, card, session, sandbox, args.afk).await
 }
@@ -147,7 +230,7 @@ fn start_sandbox(
 /// `--check`: report what config and credentials resolve to, without ever
 /// printing a key — the diagnostic for the credential snags that bite on
 /// first setup.
-fn check(project: &Path, config: &config::Config, secrets: &config::Secrets) -> Result<()> {
+async fn check(project: &Path, config: &config::Config, secrets: &config::Secrets) -> Result<()> {
     println!("project: {}", project.display());
     println!("config:  {}/config.toml", config::Config::home_dir()?.display());
     if config.model.is_empty() {
@@ -159,11 +242,13 @@ fn check(project: &Path, config: &config::Config, secrets: &config::Secrets) -> 
     println!("models:");
     for (role, model) in std::iter::once(("model", &config.model))
         .chain(config.fallbacks.iter().map(|f| ("fallback", f)))
+        .chain(config.subagent.model.iter().map(|m| ("subagent", m)))
     {
         let cred = secrets.provider_for(model).is_some();
         let price = config.prices.contains_key(model);
-        // Fallbacks reuse the task's provider client (agent::call_model).
-        let same_provider = provider(model) == provider(&config.model);
+        // Fallbacks reuse the task's provider client (agent::call_model);
+        // subagents build their own.
+        let same_provider = role != "fallback" || provider(model) == provider(&config.model);
         if !cred || !same_provider {
             all_ok = false;
         }
@@ -190,6 +275,12 @@ fn check(project: &Path, config: &config::Config, secrets: &config::Secrets) -> 
         if writable { "writable" } else { "NOT writable — run: chmod 700 ~/.tursi ~/.tursi/stats" }
     );
 
+    if let Some(balance) = crate::balance::Balance::from_config(&config, &secrets) {
+        match balance.fetch().await {
+            Ok(usd) => println!("balance: ${usd:.2} prepaid credit at the provider"),
+            Err(e) => println!("balance: unavailable ({e:#})"),
+        }
+    }
     println!(
         "\n{}",
         if all_ok {
@@ -246,23 +337,14 @@ fn project_root_from(start: &Path, home: Option<&Path>) -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Internal tracing → `.tursi/harness.log` (tool output goes to debug.log,
-/// §1 — separate files keep log_full's byte offsets stable). The guard must
-/// live as long as the process: dropped, the writer thread stops.
-fn init_logging(project: &Path) -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    let file = tracing_appender::rolling::never(project.join(".tursi"), "harness.log");
-    let (writer, guard) = tracing_appender::non_blocking(file);
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(writer)
-        .with_ansi(false)
-        .finish();
+/// Internal tracing → `trace` events in the project ledger (`ledger.rs`).
+/// Events before the session opens are held and flushed when it does.
+fn init_logging() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::registry().with(filter).with(ledger::TraceLayer);
     // Second init (tests) is fine — the first subscriber stays.
     let _ = tracing::subscriber::set_global_default(subscriber);
-    Ok(guard)
 }
 
 #[cfg(test)]

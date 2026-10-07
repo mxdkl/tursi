@@ -207,11 +207,11 @@ fn loopback_up() -> Result<()> {
         *dst = *src as libc::c_char;
     }
     let result = unsafe {
-        if libc::ioctl(sock, libc::SIOCGIFFLAGS, &mut req) < 0 {
+        if libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut req) < 0 {
             Err(std::io::Error::last_os_error())
         } else {
             req.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-            if libc::ioctl(sock, libc::SIOCSIFFLAGS, &req) < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+            if libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &req) < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
         }
     };
     unsafe { libc::close(sock) };
@@ -335,6 +335,39 @@ fn apply(root: &Path, m: &Mount) -> Result<()> {
 /// noexec, atime) or a user namespace gets EPERM. The listed path itself must
 /// succeed; nested mounts (/sys has dozens) are best effort — ordinary file
 /// permissions still apply under any that stay writable.
+/// The project read-only for this process alone; build-output directories
+/// stay writable (bound over themselves first, so the remount skips them).
+fn project_read_only(ro: &protocol::ReadOnly) -> Result<()> {
+    let none = None::<&str>;
+    unshare(CloneFlags::CLONE_NEWNS).context("private mount namespace")?;
+    mount(none, "/", none, MsFlags::MS_REC | MsFlags::MS_PRIVATE, none).context("making mounts private")?;
+    for dir in ro.writable.iter().filter(|d| d.starts_with(&ro.project) && d.is_dir()) {
+        mount(Some(dir.as_path()), dir, none, MsFlags::MS_BIND, none).with_context(|| format!("keeping {} writable", dir.display()))?;
+    }
+    remount_read_only(&ro.project).with_context(|| format!("read-only remount of {}", ro.project.display()))
+}
+
+/// Remount one mount point read-only, keeping the flags a user namespace may
+/// not drop (nosuid, nodev, noexec, atime) or the remount fails with EPERM.
+fn remount_read_only(point: &Path) -> nix::Result<()> {
+    let locked = statvfs(point)?.flags();
+    let mut flags = MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY;
+    for (st, ms) in [
+        (FsFlags::ST_NOSUID, MsFlags::MS_NOSUID),
+        (FsFlags::ST_NODEV, MsFlags::MS_NODEV),
+        (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
+        (FsFlags::ST_NOATIME, MsFlags::MS_NOATIME),
+        (FsFlags::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
+        // ST_RELATIME, which nix leaves out on musl.
+        (FsFlags::from_bits_retain(0x1000), MsFlags::MS_RELATIME),
+    ] {
+        if locked.contains(st) {
+            flags |= ms;
+        }
+    }
+    mount(None::<&str>, point, None::<&str>, flags, None::<&str>)
+}
+
 fn remount_tree_read_only(top: &Path) -> Result<()> {
     let mut points = vec![top.to_path_buf()];
     for line in std::fs::read_to_string("/proc/self/mountinfo")?.lines() {
@@ -346,21 +379,7 @@ fn remount_tree_read_only(top: &Path) -> Result<()> {
         }
     }
     for point in points {
-        let locked = statvfs(&point)?.flags();
-        let mut flags = MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY;
-        for (st, ms) in [
-            (FsFlags::ST_NOSUID, MsFlags::MS_NOSUID),
-            (FsFlags::ST_NODEV, MsFlags::MS_NODEV),
-            (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
-            (FsFlags::ST_NOATIME, MsFlags::MS_NOATIME),
-            (FsFlags::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
-            (FsFlags::ST_RELATIME, MsFlags::MS_RELATIME),
-        ] {
-            if locked.contains(st) {
-                flags |= ms;
-            }
-        }
-        let remounted = mount(None::<&str>, &point, None::<&str>, flags, None::<&str>);
+        let remounted = remount_read_only(&point);
         if point == top {
             remounted.with_context(|| format!("read-only remount of {}", point.display()))?;
         }
@@ -455,8 +474,8 @@ fn serve(workload: BorrowedFd) -> Result<()> {
             match protocol::recv::<Request>(INIT_FD)? {
                 // The harness is gone: exiting as PID 1 kills everything inside.
                 None => return Ok(()),
-                Some((Request::Spawn { id, argv, env, cwd }, fds)) => {
-                    let event = match spawn(&argv, &env, &cwd, fds, workload, &sigchld) {
+                Some((Request::Spawn { id, argv, env, cwd, read_only }, fds)) => {
+                    let event = match spawn(&argv, &env, &cwd, fds, workload, &sigchld, read_only.as_ref()) {
                         Ok(pid) => {
                             running.insert(pid, id);
                             Event::Spawned { id }
@@ -504,6 +523,7 @@ fn spawn(
     fds: Vec<OwnedFd>,
     workload: BorrowedFd,
     sigchld: &SigSet,
+    read_only: Option<&protocol::ReadOnly>,
 ) -> Result<Pid> {
     let [stdin, stdout, stderr]: [OwnedFd; 3] =
         fds.try_into().map_err(|_| anyhow!("spawn needs exactly three descriptors"))?;
@@ -520,7 +540,7 @@ fn spawn(
     match unsafe { fork() }? {
         ForkResult::Child => {
             drop(err_read);
-            let error = exec_workload(&args, &envp, cwd, [&stdin, &stdout, &stderr], workload, sigchld);
+            let error = exec_workload(&args, &envp, cwd, [&stdin, &stdout, &stderr], workload, sigchld, read_only);
             let _ = nix::unistd::write(&err_write, format!("{error:#}").as_bytes());
             unsafe { libc::_exit(127) }
         }
@@ -550,10 +570,18 @@ fn exec_workload(
     stdio: [&OwnedFd; 3],
     workload: BorrowedFd,
     sigchld: &SigSet,
+    read_only: Option<&protocol::ReadOnly>,
 ) -> anyhow::Error {
     let attempt = || -> Result<std::convert::Infallible> {
         sigchld.thread_unblock()?;
         nix::unistd::setsid()?;
+        // Before joining the workload namespace, while this child still holds
+        // the init's mount rights: a private mount namespace where the
+        // project is read-only. The workload has no mount rights over it, so
+        // it cannot undo this (§5.7, PERMISSIONS.md §3).
+        if let Some(ro) = read_only {
+            project_read_only(ro)?;
+        }
         nix::sched::setns(workload, CloneFlags::CLONE_NEWUSER).context("joining the workload user namespace")?;
         keep_only_ptrace()?;
         for (fd, target) in stdio.iter().zip(0..) {

@@ -1,5 +1,4 @@
-/target
-/target-bookworm
+/target*
 .env
 .tursi/
 bench/jobs/

@@ -2,7 +2,6 @@
 //! machinery behind the minimal output contracts (§4, §6.3).
 
 use anyhow::Result;
-use std::io::Write;
 use std::path::Path;
 
 /// Failure markers prioritized inside the line budget (§6.3).
@@ -14,7 +13,7 @@ pub const ERROR_MARKERS: &[&str] = &[
 /// Secret-shaped names: a token `NAME=…` with one of these suffixes is scrubbed.
 const SECRET_NAME_SUFFIXES: &[&str] = &["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD"];
 
-/// Identifies one full output in `debug.log` (its byte offset); rendered as
+/// Identifies one full output in the ledger (its byte offset); rendered as
 /// `[full: log#4821]` and addressable by `log_search`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogId(pub u64);
@@ -98,19 +97,10 @@ pub fn redact(line: &str) -> String {
     out.join(" ")
 }
 
-/// Append full raw output to `.tursi/debug.log` (redacted line by line),
-/// keyed by agent id per §5.7; returns the id `log_search` retrieves by.
+/// Record a tool's full raw output in the project ledger (redacted line by
+/// line, attributed per §5.7); returns the id `log_search` retrieves by.
 pub fn log_full(project: &Path, agent: crate::bus::AgentId, tool: &str, raw: &str) -> Result<LogId> {
-    let dir = project.join(".tursi");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("debug.log");
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
-    let id = file.metadata()?.len();
-    writeln!(file, "── log#{id} agent={} tool={tool} ──", agent.0)?;
-    for line in raw.lines() {
-        writeln!(file, "{}", redact(line))?;
-    }
-    Ok(LogId(id))
+    Ok(LogId(crate::ledger::for_project(project).output(agent, tool, raw)))
 }
 
 #[cfg(test)]
@@ -153,9 +143,9 @@ mod tests {
         let a = log_full(&dir, crate::bus::ROOT, "execute_command", "one\ntwo").unwrap();
         let b = log_full(&dir, crate::bus::ROOT, "profile", "three").unwrap();
         assert!(b.0 > a.0);
-        let log = std::fs::read_to_string(dir.join(".tursi/debug.log")).unwrap();
-        assert!(log.contains(&format!("log#{}", a.0)));
-        assert!(log.contains(&format!("log#{}", b.0)));
+        let ledger = crate::ledger::for_project(&dir);
+        assert!(ledger.search(&format!("log#{}", a.0), 0, 5).contains("two"));
+        assert!(ledger.search(&format!("log#{}", b.0), 0, 5).contains("three"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

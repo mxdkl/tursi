@@ -1,12 +1,13 @@
-//! Session lifecycle, the §5.6 state machine, and the crash-resume journal.
+//! Session lifecycle and the §5.6 state machine. Every transition is a
+//! `session` event in the project ledger (`crate::ledger`), which is also
+//! what crash-resume and `tursi --sessions` read.
 
-use anyhow::{Context, Result};
-use chrono::Utc;
-use std::io::Write;
+use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::bus::AgentId;
+use crate::ledger::{Ledger, What};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -22,9 +23,9 @@ pub struct Session {
     pub state: State,
     pub project: PathBuf,
     /// Reattached to an earlier session (`--resume`): the loop restores its
-    /// transcript, the UI replays it.
+    /// conversation, the UI replays it.
     pub resumed: bool,
-    journal: PathBuf,
+    ledger: Arc<Ledger>,
 }
 
 /// One row of `tursi --sessions`.
@@ -41,103 +42,66 @@ impl Session {
     /// Open fresh, or reattach: `resume` is `"latest"` (the most recent
     /// session of this project) or an id prefix. UUIDv7 ids sort by time.
     pub fn open_or_resume(project: &Path, resume: Option<&str>) -> Result<Session> {
-        let dir = project.join(".tursi/sessions");
-        std::fs::create_dir_all(&dir)?;
-        if let Some(wanted) = resume {
-            let ids = session_ids(&dir)?;
-            let found = match wanted {
-                "latest" | "" => ids.last().copied(),
-                prefix => ids.iter().rev().find(|id| id.to_string().starts_with(prefix)).copied(),
-            };
-            let Some(id) = found else {
-                anyhow::bail!(
-                    "no session to resume{} — `tursi --sessions` lists them",
-                    if wanted == "latest" { String::new() } else { format!(" matching {wanted:?}") }
-                );
-            };
-            let journal = dir.join(format!("{id}.jsonl"));
-            let session = Session { id, state: State::Idle, project: project.to_path_buf(), resumed: true, journal };
-            session.journal(crate::bus::ROOT, "resumed")?;
-            return Ok(session);
-        }
-        let id = Uuid::now_v7();
-        let journal = dir.join(format!("{id}.jsonl"));
-        let session = Session { id, state: State::Idle, project: project.to_path_buf(), resumed: false, journal };
-        session.journal(crate::bus::ROOT, "opened")?;
+        let ledger = crate::ledger::for_project(project);
+        let (id, resumed) = match resume {
+            Some(wanted) => {
+                let ids = ledger.session_ids();
+                let found = match wanted {
+                    "latest" | "" => ids.last().copied(),
+                    prefix => ids.iter().rev().find(|id| id.to_string().starts_with(prefix)).copied(),
+                };
+                let Some(id) = found else {
+                    anyhow::bail!(
+                        "no session to resume{} — `tursi --sessions` lists them",
+                        if wanted == "latest" { String::new() } else { format!(" matching {wanted:?}") }
+                    );
+                };
+                (id, true)
+            }
+            None => (Uuid::now_v7(), false),
+        };
+        ledger.set_session(id);
+        crate::ledger::set_primary(ledger.clone());
+        let session = Session { id, state: State::Idle, project: project.to_path_buf(), resumed, ledger };
+        session.journal(if resumed { "resumed" } else { "opened" });
         Ok(session)
-    }
-
-    /// Where a session's transcript is persisted (`agent::AgentLoop::persist`).
-    pub fn transcript_path(project: &Path, id: Uuid) -> PathBuf {
-        project.join(".tursi/sessions").join(format!("{id}.transcript.json"))
     }
 
     /// Recent sessions of this project, oldest first.
     pub fn list(project: &Path) -> Result<Vec<Summary>> {
-        let dir = project.join(".tursi/sessions");
-        let mut out = Vec::new();
-        for id in session_ids(&dir).unwrap_or_default() {
-            let journal = std::fs::read_to_string(dir.join(format!("{id}.jsonl"))).unwrap_or_default();
-            let line = |l: &str| serde_json::from_str::<serde_json::Value>(l).ok();
-            let started = journal.lines().next().and_then(line).and_then(|v| v.get("ts")?.as_str().map(|s| s.chars().take(16).collect::<String>().replace('T', " "))).unwrap_or_default();
-            let closed = journal.lines().last().and_then(line).and_then(|v| Some(v.get("event")?.as_str()? == "closed")).unwrap_or(false);
-            let (first_prompt, messages) = std::fs::read_to_string(Self::transcript_path(project, id))
-                .ok()
-                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                .and_then(|v| {
-                    let msgs = v.get("messages")?.as_array()?;
-                    let first = msgs.iter().find_map(|m| m.get("User")?.as_str().map(|s| s.lines().next().unwrap_or("").chars().take(60).collect::<String>()));
-                    Some((first.unwrap_or_default(), msgs.len()))
-                })
-                .unwrap_or_default();
-            out.push(Summary { id, started, closed, first_prompt, messages });
-        }
-        Ok(out)
+        Ok(crate::ledger::for_project(project)
+            .sessions()
+            .into_iter()
+            .map(|s| Summary {
+                id: s.id,
+                started: s.started.format("%Y-%m-%d %H:%M").to_string(),
+                closed: s.closed,
+                first_prompt: s.first_prompt,
+                messages: s.messages,
+            })
+            .collect())
     }
 
-    /// Transition + journal append; a same-state transition is a no-op.
+    /// Transition + ledger event; a same-state transition is a no-op.
     pub fn transition(&mut self, to: State) -> Result<()> {
         if to == self.state {
             return Ok(());
         }
-        self.journal(crate::bus::ROOT, &format!("state {:?} -> {to:?}", self.state))?;
+        self.journal(&format!("state {:?} -> {to:?}", self.state));
         self.state = to;
         Ok(())
     }
 
-    /// One JSONL line per event (agent id per §5.7): state changes, task
-    /// starts/ends.
-    fn journal(&self, agent: AgentId, event: &str) -> Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.journal)
-            .with_context(|| format!("journal {}", self.journal.display()))?;
-        writeln!(
-            file,
-            "{}",
-            serde_json::json!({"ts": Utc::now(), "agent": agent.0, "event": event})
-        )?;
+    fn journal(&self, event: &str) {
+        self.ledger.append(crate::bus::ROOT, What::Session { event: event.to_string() });
+    }
+
+    /// Clean close: the final session event is what marks a session
+    /// resumable or not.
+    pub fn close(self) -> Result<()> {
+        self.journal("closed");
         Ok(())
     }
-
-    /// Clean close: the final journal line is what marks a session resumable
-    /// or not.
-    pub fn close(self) -> Result<()> {
-        self.journal(crate::bus::ROOT, "closed")
-    }
-}
-
-/// Every session id in the directory, oldest first.
-fn session_ids(dir: &Path) -> Result<Vec<Uuid>> {
-    let mut ids: Vec<Uuid> = std::fs::read_dir(dir)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .filter_map(|p| Uuid::parse_str(p.file_stem()?.to_str()?).ok())
-        .collect();
-    ids.sort();
-    Ok(ids)
 }
 
 #[cfg(test)]
@@ -179,10 +143,7 @@ mod tests {
         s.transition(State::Running).unwrap();
         s.transition(State::Verifying).unwrap();
         assert_eq!(s.state, State::Verifying);
-        let journal = std::fs::read_to_string(
-            dir.join(".tursi/sessions").join(format!("{}.jsonl", s.id)),
-        )
-        .unwrap();
+        let journal = crate::ledger::raw(&dir);
         assert!(journal.contains("opened"));
         assert_eq!(journal.matches("state ").count(), 2, "no-op not journaled");
         assert!(journal.contains("Running -> Verifying"));

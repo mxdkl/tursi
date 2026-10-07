@@ -97,13 +97,18 @@ pub enum Provider {
 impl Provider {
     /// Adapter for whichever provider serves `model`, using the base URL and
     /// key from `secrets.toml` (prefix-routed: "deepseek/…" → deepseek entry).
-    pub fn for_model(model: &str, secrets: &crate::config::Secrets) -> Result<Provider> {
+    pub fn for_model(model: &str, secrets: &crate::config::Secrets, config: &crate::config::Config) -> Result<Provider> {
         let (key, base_url) = secrets.provider_for(model).ok_or_else(|| {
             anyhow::anyhow!(
                 "no credentials for {model} — add it to ~/.tursi/secrets.toml or set <PREFIX>_API_KEY"
             )
         })?;
-        Ok(Provider::OpenAiCompat(openai_compat::Client::new(key, base_url)))
+        let client = openai_compat::Client::new(key, base_url).with_headers(secrets.headers_for(model));
+        let client = match config.models.get(model) {
+            Some(options) => client.with_options(options),
+            None => client,
+        };
+        Ok(Provider::OpenAiCompat(client))
     }
 
     /// One streaming chat call; deltas go to `events`, the settled turn returns.

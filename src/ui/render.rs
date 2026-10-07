@@ -1,4 +1,8 @@
-//! Frame layout (§2): header / transcript / input / status, overlays on top.
+//! Frame layout (§2): a header line, the chat column (transcript, input,
+//! status line), and the agent block — still braille where each working
+//! subagent lights one colored dot — beside the chat on wide terminals,
+//! above it on narrow ones. It is always there, so the chat never resizes.
+//! Overlays on top.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -6,68 +10,81 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use super::{App, Mode, Overlay};
+use super::{App, Overlay};
+
+/// At or above this width the chat sits beside the tiles; below, under them.
+const SIDE_BY_SIDE: u16 = 110;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let full = frame.area();
-    // The input box grows with wrapped content so long input never runs off
-    // the edge; capped so a big paste can't swallow the transcript.
-    let input_h = input_height(app, full.width);
-    let [header_area, transcript_area, input_area, status_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(input_h),
-        Constraint::Length(1),
-    ])
-    .areas(full);
-
-    header(frame, header_area, app);
-    transcript(frame, transcript_area, app);
-    input_bar(frame, input_area, app);
-    status_bar(frame, status_area, app);
+    let t = app.clock.elapsed().as_secs_f32();
+    if full.width >= SIDE_BY_SIDE {
+        // Three quarters chat (with the header above it), one quarter agent
+        // block running the full height.
+        let chat_w = full.width * 3 / 4;
+        let [left, _gap, field_area] =
+            Layout::horizontal([Constraint::Length(chat_w), Constraint::Length(1), Constraint::Min(10)]).areas(full);
+        let [header_area, chat_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).areas(left);
+        header(frame, header_area, app);
+        chat(frame, chat_area, app);
+        super::agents::draw(frame, field_area, &app.tiles, t);
+    } else {
+        let [header_area, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).areas(full);
+        header(frame, header_area, app);
+        let [field_area, chat_area] = Layout::vertical([Constraint::Percentage(25), Constraint::Min(8)]).areas(body);
+        super::agents::draw(frame, field_area, &app.tiles, t);
+        chat(frame, chat_area, app);
+    }
     if app.overlay.is_some() {
         overlay(frame, full, app);
     }
 }
 
 fn header(frame: &mut Frame, area: Rect, app: &App) {
-    let project = app
-        .session
-        .project
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("?");
-    let mut spans = vec![
-        Span::styled(format!(" {project} "), Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("│ "),
-    ];
+    let project = app.session.project.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+    let mut spans = vec![Span::styled(format!(" {project} "), Style::default().add_modifier(Modifier::BOLD)), Span::raw("│ ")];
     if app.plan_active {
         spans.push(Span::styled("PLAN ", Style::default().fg(Color::Magenta)));
     }
     if app.afk {
         spans.push(Span::styled("AFK ", Style::default().fg(Color::Cyan)));
     }
-    spans.push(Span::raw(format!(
-        "│ {} │ Sess ${:.2} │ Mo ${:.2} │ ",
-        app.model, app.session_usd, app.month_usd
-    )));
-    // Context-window gauge: percent full + rough token size, colored as it
-    // approaches the compaction threshold (§8).
-    let pct = if app.ctx_window > 0 {
-        (app.ctx_used as f64 / app.ctx_window as f64 * 100.0).round() as u64
-    } else {
-        0
-    };
+    spans.push(Span::raw(match app.balance_usd {
+        Some(bal) => format!("{} │ bal ${bal:.2} │ ", app.model),
+        None => format!("{} │ ${:.2} session │ ", app.model, app.session_usd),
+    }));
+    // Context-window gauge, colored as it nears the compaction threshold (§8).
+    let pct = if app.ctx_window > 0 { (app.ctx_used as f64 / app.ctx_window as f64 * 100.0).round() as u64 } else { 0 };
     let ctx_color = match pct {
         p if p >= 75 => Color::Red,
         p if p >= 60 => Color::Yellow,
         _ => Color::DarkGray,
     };
-    spans.push(Span::styled(
-        format!("ctx {pct}% ({}k)", app.ctx_used / 1000),
-        Style::default().fg(ctx_color),
-    ));
+    spans.push(Span::styled(format!("ctx {pct}%"), Style::default().fg(ctx_color)));
+    // Subagent jobs are listed with the monitors but have their own tiles.
+    let monitors: Vec<String> = app.monitors.iter().filter(|(id, _)| !id.starts_with("agent-")).map(|(id, label)| format!("{id} {label}")).collect();
+    if !monitors.is_empty() {
+        spans.push(Span::styled(format!(" │ ⏱ {}", monitors.join(", ")), Style::default().fg(Color::Yellow)));
+    }
+    if let Some((_, since, turns, _)) = &app.goal {
+        let s = since.elapsed().as_secs();
+        let elapsed = if s < 60 { format!("{s}s") } else { format!("{}m", s / 60) };
+        spans.push(Span::styled(format!(" │ ◎ goal {elapsed} · {turns} turns"), Style::default().fg(Color::Cyan)));
+    }
+    if let Some((filled, total)) = app.stubs {
+        spans.push(Span::styled(format!(" │ stubs {filled}/{total}"), Style::default().fg(Color::Magenta)));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Black)), area);
+}
+
+/// The chat column: transcript, input box, one status line.
+fn chat(frame: &mut Frame, area: Rect, app: &mut App) {
+    let input_h = input_height(app, area.width);
+    let [transcript_area, input_area, status_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(input_h), Constraint::Length(1)]).areas(area);
+    transcript(frame, transcript_area, app);
+    input_bar(frame, input_area, app);
+    status_line(frame, status_area, app);
 }
 
 /// Bottom-anchored scrollback: scroll == 0 means "latest" (newbbs model) —
@@ -75,12 +92,12 @@ fn header(frame: &mut Frame, area: Rect, app: &App) {
 fn transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let height = area.height as usize;
     app.view_height = height;
-    let width = area.width.saturating_sub(1) as usize;
-    let mut lines = super::transcript::render(&app.transcript, width, app.verbose);
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines = super::transcript::render(&app.transcript, width);
     if !app.partial.trim().is_empty() {
         // The block being streamed, rendered as if already closed.
         let live = [super::transcript::Entry::Agent(app.partial.trim_end().to_string())];
-        lines.extend(super::transcript::render(&live, width, app.verbose));
+        lines.extend(super::transcript::render(&live, width));
     }
     app.line_count = lines.len();
     let max_scroll = lines.len().saturating_sub(height);
@@ -88,6 +105,30 @@ fn transcript(frame: &mut Frame, area: Rect, app: &mut App) {
     let end = lines.len() - app.scroll;
     let start = end.saturating_sub(height);
     frame.render_widget(Paragraph::new(lines[start..end].to_vec()).block(Block::default().padding(ratatui::widgets::Padding::left(1))), area);
+}
+
+/// What the line under the input says: a status message if there is one,
+/// else the working line while a task runs, else the key hints.
+fn status_line(frame: &mut Frame, area: Rect, app: &App) {
+    let (text, style) = if let Some(status) = &app.status {
+        let style = if status.starts_with('✗') { Style::default().fg(Color::Red) } else { Style::default().fg(Color::DarkGray) };
+        (status.clone(), style)
+    } else if app.task_running {
+        let s = app.task_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        let elapsed = if s < 60 { format!("{s}s") } else { format!("{}m {:02}s", s / 60, s % 60) };
+        let running = app.tiles.iter().filter(|t| t.running()).count();
+        let agents = match running {
+            0 => String::new(),
+            1 => " · 1 agent working".to_string(),
+            n => format!(" · {n} agents working"),
+        };
+        (format!("⋯ working {elapsed} · {}{agents} · Esc interrupts", super::agents::steps(app.lead_steps)), Style::default().fg(Color::Yellow))
+    } else {
+        ("Enter send · /help commands · PgUp/PgDn scroll · Ctrl+C quit".to_string(), Style::default().fg(Color::DarkGray))
+    };
+    let width = area.width.saturating_sub(1) as usize;
+    let text: String = text.chars().take(width).collect();
+    frame.render_widget(Paragraph::new(Line::styled(format!(" {text}"), style)), area);
 }
 
 /// Longest the input box may grow (content rows, excluding borders) before it
@@ -104,14 +145,10 @@ fn input_inner_width(full_width: u16) -> usize {
     input_box_width(full_width).saturating_sub(2).max(1) as usize
 }
 
-/// The active buffer as it's shown, with the cursor's char index into it. One
-/// leading space (" text"); command mode leads with " :" — so ":help" sits a
-/// space in from the border.
+/// The buffer as it's shown, with the cursor's char index into it: one
+/// leading space so text sits a space in from the border.
 fn input_display(app: &App) -> (String, usize) {
-    match app.mode {
-        Mode::Command => (format!(" :{}", app.command), 2 + app.command.chars().count()),
-        _ => (format!(" {}", app.input), 1 + app.cursor),
-    }
+    (format!(" {}", app.input), 1 + app.cursor)
 }
 
 /// Character-wrap `content` to `inner` columns and locate the cursor. Character
@@ -142,10 +179,10 @@ fn input_height(app: &App, full_width: u16) -> u16 {
 }
 
 fn input_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let (title, border) = match app.mode {
-        Mode::Insert => (" INSERT ", Style::default().fg(Color::Green)),
-        Mode::Command => (" : ", Style::default().fg(Color::Yellow)),
-        Mode::Normal => (" i to type ", Style::default().fg(Color::DarkGray)),
+    let (title, border) = if app.task_running {
+        (" steer the running task ", Style::default().fg(Color::Yellow))
+    } else {
+        (" message ", Style::default().fg(Color::Green))
     };
     let width = input_box_width(area.width);
     let box_area = Rect { x: area.x + (area.width - width) / 2, width, ..area };
@@ -157,53 +194,13 @@ fn input_bar(frame: &mut Frame, area: Rect, app: &App) {
     // taller than the (capped) box.
     let visible = (box_area.height as usize).saturating_sub(2).max(1);
     let first = cur_row.saturating_sub(visible - 1);
-    let shown: Vec<Line> = rows[first..(first + visible).min(rows.len())]
-        .iter()
-        .map(|r| Line::raw(r.clone()))
-        .collect();
-    frame.render_widget(
-        Paragraph::new(shown).block(Block::default().borders(Borders::ALL).title(title).border_style(border)),
-        box_area,
-    );
-    // Cursor: +1 for the left border; the leading space/colon is already inside
-    // `content`, so it's counted in cur_col.
-    if app.mode != Mode::Normal {
+    let shown: Vec<Line> = rows[first..(first + visible).min(rows.len())].iter().map(|r| Line::raw(r.clone())).collect();
+    frame.render_widget(Paragraph::new(shown).block(Block::default().borders(Borders::ALL).title(title).border_style(border)), box_area);
+    if app.overlay.is_none() {
         let x = box_area.x + 1 + cur_col as u16;
         let y = box_area.y + 1 + (cur_row - first) as u16;
         frame.set_cursor_position((x, y));
     }
-}
-
-fn status_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let (mode, color) = match app.mode {
-        Mode::Normal => ("-- NORMAL --", Color::Blue),
-        Mode::Insert => ("-- INSERT --", Color::Green),
-        Mode::Command => ("-- COMMAND --", Color::Yellow),
-    };
-    let mut spans = vec![Span::styled(mode, Style::default().fg(color).add_modifier(Modifier::BOLD))];
-    if app.task_running {
-        spans.push(Span::styled("  ⋯ running (Esc interrupts)", Style::default().fg(Color::Yellow)));
-    }
-    if let Some((filled, total)) = app.stubs {
-        spans.push(Span::styled(
-            format!("  stubs {filled}/{total}"),
-            Style::default().fg(Color::Magenta),
-        ));
-    }
-    if !app.monitors.is_empty() {
-        let list: Vec<String> = app.monitors.iter().map(|(id, label)| format!("{id} {label}")).collect();
-        spans.push(Span::styled(format!("  ⏱ {}", list.join(", ")), Style::default().fg(Color::Yellow)));
-    }
-    if let Some(status) = &app.status {
-        spans.push(Span::raw("  "));
-        let style = if status.starts_with('✗') {
-            Style::default().fg(Color::Red)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        spans.push(Span::styled(status.as_str(), style));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Overlays render centered over the transcript: approval diff (y/n/a),
@@ -291,17 +288,122 @@ fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 }
 
 const HELP: &str = "\
-NORMAL   j/k scroll · gg/G top/bottom · PgUp/PgDn page · Ctrl+O expand results
-         i/a insert · : command · Esc interrupt (while running)
-INSERT   Enter send (steers a running task) · Ctrl+U clear · Ctrl+W del word
-COMMAND  :q :help :afk :model [id] :rewind [n]
-         :plan [task] :approve :sysinfo :log <pattern>
-         :monitors · :monitor stop <id>
-OVERLAY  network: y/n · ask: 1-9 or type · Ctrl+C always quits";
+TYPE      Enter send (steers the lead while it works) · Esc interrupt
+          Up/Down earlier messages · Ctrl+U clear · Ctrl+W delete word
+          Ctrl+A/E start/end · PgUp/PgDn scroll · Ctrl+Home/End top/bottom
+COMMANDS  /goal [condition|clear] · /plan [task] · /approve
+          /afk · /model [id] · /monitors · /monitor stop <id>
+          /log <pattern> · /sysinfo · /help · /quit
+PROMPTS   network: y/n · questions: 1-9 or type an answer
+          Ctrl+C clears the line, or quits when it's empty
+
+The chat shows you and the lead. In the braille block beside it, each
+working subagent lights one dot: blue for a reader, green for a writer.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Draws a session with the lead and three subagents into an in-memory
+    /// terminal (`cargo test frame_ -- --nocapture` prints it).
+    fn frame_text(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    fn busy_app() -> App {
+        use crate::bus::{AgentId, EventKind, ROOT, UiEvent};
+        let (mut app, ..) = crate::ui::testui::app("render-frame");
+        app.transcript.push(crate::ui::transcript::Entry::User("read the todo file and continue".into()));
+        app.apply_event(UiEvent { agent: ROOT, kind: EventKind::AgentText("Three independent items: a writer for each, and a reader for the loader.".into()) });
+        app.apply_event(UiEvent { agent: ROOT, kind: EventKind::ToolStarted { name: "agent".into(), summary: "writer: ...".into() } });
+        app.task_running = true;
+        app.task_started = Some(std::time::Instant::now());
+        for (n, access, title) in [(1, "writer", "Add a step budget to the VM loop"), (2, "writer", "Fix the gather mask for inactive lanes"), (3, "reader", "Map how the ELF loader places segments")] {
+            app.apply_event(UiEvent { agent: AgentId(n), kind: EventKind::SubagentStarted { access: access.into(), title: title.into(), model: "cloudflare/@cf/deepseek-ai/deepseek-v4-flash-0731".into(), continued: false } });
+        }
+        app.apply_event(UiEvent { agent: AgentId(1), kind: EventKind::ToolStarted { name: "read".into(), summary: "src/cpu.rs".into() } });
+        app.apply_event(UiEvent { agent: AgentId(1), kind: EventKind::ToolStarted { name: "execute_command".into(), summary: "cargo test --release".into() } });
+        app.apply_event(UiEvent { agent: AgentId(1), kind: EventKind::ToolFinished { name: "execute_command".into(), content: "1 ✗ cargo test exit 101".into(), is_error: true } });
+        app.apply_event(UiEvent { agent: AgentId(2), kind: EventKind::AgentText("The mask is built from the wrong lane bits.\n".into()) });
+        app.apply_event(UiEvent { agent: AgentId(3), kind: EventKind::SubagentFinished { ok: true } });
+        app
+    }
+
+    fn field_colors(text_app: &mut App, w: u16, h: u16) -> Vec<(u8, u8, u8)> {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, text_app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|c| c.symbol().chars().all(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch)))
+            .filter_map(|c| match c.fg {
+                Color::Rgb(r, g, b) => Some((r, g, b)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn frame_wide_puts_the_chat_beside_the_agent_field() {
+        let mut app = busy_app();
+        let text = frame_text(&mut app, 150, 30);
+        eprintln!("\n{text}\n");
+        assert!(text.contains("❯ read the todo file and continue"));
+        assert!(text.contains("● Three independent items"));
+        for hidden in ["agent(writer", "Add a step budget", "$ cargo test", "src/mem.rs", "agent-"] {
+            assert!(!text.contains(hidden), "{hidden:?} should not be on screen");
+        }
+        assert!(text.contains("2 writers"), "legend counts working agents by kind");
+        assert!(text.contains("2 agents working"), "status line counts running agents");
+        // Two working writers share one green cell, top-left of the block;
+        // the finished explorer has faded once its fade time is past.
+        if let Some(explorer) = app.tiles.iter_mut().find(|t| t.id == 3) {
+            explorer.ended = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        }
+        let dots = field_colors(&mut app, 150, 30);
+        assert_eq!(dots.len(), 1, "{dots:?}");
+        assert!(dots.iter().all(|(r, g, b)| g > r && g > b), "writers are green");
+        let braille = text.chars().filter(|c| ('\u{2801}'..='\u{28ff}').contains(c)).count();
+        assert!(braille <= 2, "unlit dots are invisible");
+        // The chat takes three quarters of the width.
+        let input_right = text.lines().find(|l| l.contains("┌ steer")).and_then(|l| l.chars().position(|c| c == '┐')).unwrap();
+        assert!(text.contains("┌ agents "), "the block is framed and titled");
+        assert!(text.lines().next().unwrap().contains("┌ agents "), "the block starts on the top line, beside the header");
+        assert!(input_right > 100 && input_right < 115, "chat ≈ 3/4 of 150 columns, got {input_right}");
+    }
+
+    #[test]
+    fn frame_narrow_stacks_the_field_over_the_chat() {
+        let mut app = busy_app();
+        let text = frame_text(&mut app, 90, 40);
+        eprintln!("\n{text}\n");
+        let field_row = text.lines().position(|l| l.contains("2 writers")).unwrap();
+        let chat_row = text.lines().position(|l| l.contains("❯ read the todo")).unwrap();
+        assert!(field_row < chat_row, "field above the chat on a narrow terminal");
+    }
+
+    #[test]
+    fn frame_keeps_the_pane_when_no_agent_is_working() {
+        let (mut app, ..) = crate::ui::testui::app("render-plain");
+        app.transcript.push(crate::ui::transcript::Entry::User("hello".into()));
+        let idle = frame_text(&mut app, 150, 16);
+        assert!(idle.contains("❯ hello") && idle.contains("Enter send · /help"));
+        assert!(field_colors(&mut app, 150, 16).is_empty(), "no agents, no colored dots");
+        assert!(idle.contains("┌ agents "), "an idle block still shows its frame");
+        // The chat column is as wide with agents as without: it never resizes.
+        let mut busy = busy_app();
+        let with = frame_text(&mut busy, 150, 16);
+        let input_width = |t: &str| {
+            t.lines().find(|l| l.contains("┌ message") || l.contains("┌ steer")).and_then(|l| l.chars().position(|c| c == '┐')).unwrap_or(0)
+        };
+        assert!(input_width(&idle) > 0);
+        assert_eq!(input_width(&idle), input_width(&with));
+    }
 
     #[test]
     fn short_input_is_one_row_with_the_cursor_on_it() {

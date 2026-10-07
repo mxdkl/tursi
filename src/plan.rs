@@ -26,19 +26,19 @@ pub struct PlanState {
     /// Planning phase: per-edit approval suspended (§5.5).
     pub active: bool,
     pub approved: bool,
-    /// Stub count at `:approve` — the denominator of the fill-in meter.
+    /// Stub count at `/approve` — the denominator of the fill-in meter.
     pub total_stubs: usize,
 }
 
 impl PlanState {
-    /// `:plan` — the next task is a skeleton, not an implementation.
+    /// `/plan` — the next task is a skeleton, not an implementation.
     pub fn enter(&mut self) {
         self.active = true;
         self.approved = false;
         self.total_stubs = 0;
     }
 
-    /// `:approve` — plan phase ends, fill-in begins with this denominator.
+    /// `/approve` — plan phase ends, fill-in begins with this denominator.
     /// In AFK the gate's green auto-grants this (§5.5).
     pub fn approve(&mut self, total_stubs: usize) {
         self.active = false;

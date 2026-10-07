@@ -1,11 +1,11 @@
-//! Modal key handling: Normal to move, Insert to talk, Command for verbs.
-//! Lifted from the newbbs pattern — the keymap stays small enough that
-//! `:help` fits on one screen.
+//! Key handling, no modes: typing always edits the input, Enter sends it
+//! (or runs a `/command`), Esc interrupts a running task. The chat scrolls
+//! with PgUp/PgDn; Up/Down recall earlier inputs.
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use super::{App, Mode, Overlay};
+use super::{App, Overlay};
 use crate::bus::ApprovalReply;
 
 pub async fn handle(app: &mut App, key: KeyEvent) -> Result<()> {
@@ -13,87 +13,46 @@ pub async fn handle(app: &mut App, key: KeyEvent) -> Result<()> {
     if key.kind == KeyEventKind::Release {
         return Ok(());
     }
-    // Always available, in every mode, so the session can never be trapped.
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.quit();
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Ctrl+C clears a half-typed line; otherwise it always quits, in every
+    // state, so the session can never be trapped.
+    if key.code == KeyCode::Char('c') && ctrl {
+        if app.overlay.is_none() && !app.input.is_empty() {
+            clear(app);
+        } else {
+            app.quit();
+        }
         return Ok(());
     }
     if app.overlay.is_some() {
         return overlay(app, key).await;
     }
-    match app.mode {
-        Mode::Normal => normal(app, key).await,
-        Mode::Insert => insert(app, key).await,
-        Mode::Command => command_line(app, key).await,
-    }
-}
-
-/// j/k/gg/G/paging scroll; i/a → Insert; ':' → Command; Esc interrupts a
-/// running task (§5.2), otherwise clears pending/scroll.
-async fn normal(app: &mut App, key: KeyEvent) -> Result<()> {
-    if let Some('g') = app.pending {
-        app.pending = None;
-        if key.code == KeyCode::Char('g') {
-            app.scroll = app.line_count.saturating_sub(app.view_height);
-            return Ok(());
-        }
-    }
     let page = app.view_height.saturating_sub(1).max(1);
-    if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.verbose = !app.verbose;
-        app.set_status(if app.verbose { "showing full tool results" } else { "tool results collapsed" });
-        return Ok(());
-    }
     match key.code {
-        KeyCode::Char('i') | KeyCode::Char('a') => {
-            app.mode = Mode::Insert;
-            if key.code == KeyCode::Char('a') {
-                app.cursor = app.input.chars().count();
-            }
-        }
-        KeyCode::Char(':') => {
-            app.mode = Mode::Command;
-            app.command.clear();
-        }
-        KeyCode::Char('g') => app.pending = Some('g'),
-        KeyCode::Char('G') => app.scroll = 0,
-        KeyCode::Char('j') | KeyCode::Down => app.scroll = app.scroll.saturating_sub(1),
-        KeyCode::Char('k') | KeyCode::Up => app.scroll += 1,
-        KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(page),
-        KeyCode::PageUp => app.scroll += page,
+        KeyCode::Enter => submit(app).await?,
         KeyCode::Esc => {
             if app.task_running {
                 app.interrupt();
             } else {
-                app.pending = None;
+                clear(app);
+                app.status = None;
                 app.scroll = 0;
             }
         }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Char-indexed editing with a byte_index helper (multi-byte-safe); Ctrl+U
-/// clears, Ctrl+W deletes a word; Enter submits and returns to Normal.
-async fn insert(app: &mut App, key: KeyEvent) -> Result<()> {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    match key.code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Enter => {
-            app.send_message().await?;
-            // Back to Normal so j/k work immediately (newbbs rule).
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Char('u') if ctrl => {
-            app.input.clear();
-            app.cursor = 0;
-        }
+        KeyCode::Char('d') if ctrl && app.input.is_empty() => app.quit(),
+        KeyCode::Char('u') if ctrl => clear(app),
         KeyCode::Char('w') if ctrl => delete_word(app),
-        KeyCode::Char(c) => {
+        KeyCode::Char('a') if ctrl => app.cursor = 0,
+        KeyCode::Char('e') if ctrl => app.cursor = app.input.chars().count(),
+        KeyCode::Char('k') if ctrl => {
+            let at = byte_index(&app.input, app.cursor);
+            app.input.truncate(at);
+        }
+        KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
             let at = byte_index(&app.input, app.cursor);
             app.input.insert(at, c);
             app.cursor += 1;
+            app.history_pos = None;
         }
         KeyCode::Backspace => {
             if app.cursor > 0 {
@@ -112,37 +71,66 @@ async fn insert(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Left => app.cursor = app.cursor.saturating_sub(1),
         KeyCode::Right => app.cursor = (app.cursor + 1).min(app.input.chars().count()),
+        KeyCode::Home if ctrl => app.scroll = app.line_count.saturating_sub(app.view_height),
+        KeyCode::End if ctrl => app.scroll = 0,
         KeyCode::Home => app.cursor = 0,
         KeyCode::End => app.cursor = app.input.chars().count(),
+        KeyCode::Up => recall(app, -1),
+        KeyCode::Down => recall(app, 1),
+        KeyCode::PageUp => app.scroll += page,
+        KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(page),
         _ => {}
     }
     Ok(())
 }
 
-/// Backspace past empty exits to Normal; Enter runs the verb; failures go to
-/// the status line, never tear down (newbbs rule).
-async fn command_line(app: &mut App, key: KeyEvent) -> Result<()> {
-    match key.code {
-        KeyCode::Esc => {
-            app.mode = Mode::Normal;
-            app.command.clear();
-        }
-        KeyCode::Enter => {
-            let line = std::mem::take(&mut app.command);
-            app.mode = Mode::Normal;
-            if let Err(e) = super::command::run(app, &line).await {
+fn clear(app: &mut App) {
+    app.input.clear();
+    app.cursor = 0;
+    app.history_pos = None;
+}
+
+/// Enter: a `/command` if the first word names one, otherwise a message
+/// (so a path like `/home/me/notes.md fix this` still goes to the lead).
+async fn submit(app: &mut App) -> Result<()> {
+    let text = app.input.trim().to_string();
+    if text.is_empty() {
+        return Ok(());
+    }
+    if app.history.last() != Some(&text) {
+        app.history.push(text.clone());
+    }
+    app.history_pos = None;
+    if let Some(line) = text.strip_prefix('/') {
+        let verb = line.split_whitespace().next().unwrap_or("");
+        if super::command::is_command(verb) {
+            clear(app);
+            if let Err(e) = super::command::run(app, line).await {
                 app.set_error(format!("{e:#}"));
             }
+            return Ok(());
         }
-        KeyCode::Backspace => {
-            if app.command.pop().is_none() {
-                app.mode = Mode::Normal;
-            }
-        }
-        KeyCode::Char(c) => app.command.push(c),
-        _ => {}
     }
-    Ok(())
+    app.send_message().await
+}
+
+/// Up/Down through earlier inputs; past the newest returns to an empty line.
+fn recall(app: &mut App, step: isize) {
+    if app.history.is_empty() {
+        return;
+    }
+    let last = app.history.len() - 1;
+    let next = match (app.history_pos, step < 0) {
+        (None, true) => Some(last),
+        (None, false) => None,
+        (Some(0), true) => Some(0),
+        (Some(i), true) => Some(i - 1),
+        (Some(i), false) if i >= last => None,
+        (Some(i), false) => Some(i + 1),
+    };
+    app.history_pos = next;
+    app.input = next.map(|i| app.history[i].clone()).unwrap_or_default();
+    app.cursor = app.input.chars().count();
 }
 
 /// Approval (network): y / n (reason prompt); Ask: digits pick options, text
@@ -252,39 +240,69 @@ mod tests {
     use super::*;
     use crate::ui::testui;
 
-    #[tokio::test]
-    async fn insert_mode_edits_multibyte_text_safely() {
-        let (mut app, ..) = testui::app("keys-mb");
-        handle(&mut app, press('i')).await.unwrap();
-        for c in "héllo".chars() {
-            handle(&mut app, press(c)).await.unwrap();
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    async fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            handle(app, press(c)).await.unwrap();
         }
-        handle(&mut app, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typing_goes_straight_to_the_input() {
+        let (mut app, ..) = testui::app("keys-mb");
+        typed(&mut app, "héllo").await;
+        handle(&mut app, key(KeyCode::Backspace)).await.unwrap();
         assert_eq!(app.input, "héll");
         handle(&mut app, KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)).await.unwrap();
         assert_eq!(app.input, "");
         assert_eq!(app.cursor, 0);
+        // Former vim keys are just letters now.
+        typed(&mut app, "jk:q").await;
+        assert_eq!(app.input, "jk:q");
+        assert!(!app.quitting);
     }
 
     #[tokio::test]
-    async fn command_mode_backspace_past_empty_exits_to_normal() {
-        let (mut app, ..) = testui::app("keys-cmd");
-        handle(&mut app, press(':')).await.unwrap();
-        assert_eq!(app.mode, crate::ui::Mode::Command);
-        handle(&mut app, press('q')).await.unwrap();
-        handle(&mut app, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)).await.unwrap();
-        assert_eq!(app.command, "");
-        handle(&mut app, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)).await.unwrap();
-        assert_eq!(app.mode, crate::ui::Mode::Normal);
+    async fn slash_commands_run_and_other_slashes_are_messages() {
+        let (mut app, _tx, _steer, _cancel, mut cmd_rx) = testui::app("keys-slash");
+        typed(&mut app, "/afk").await;
+        handle(&mut app, key(KeyCode::Enter)).await.unwrap();
+        assert!(app.afk && app.input.is_empty());
+        assert!(matches!(cmd_rx.try_recv().unwrap(), crate::agent::Command::SetAfk(true)));
+        typed(&mut app, "/home/me/notes.md summarize this").await;
+        handle(&mut app, key(KeyCode::Enter)).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv().unwrap(), crate::agent::Command::Task(t) if t.starts_with("/home/me")));
+        // Up recalls what was sent, newest first.
+        handle(&mut app, key(KeyCode::Up)).await.unwrap();
+        assert_eq!(app.input, "/home/me/notes.md summarize this");
+        handle(&mut app, key(KeyCode::Up)).await.unwrap();
+        assert_eq!(app.input, "/afk");
+        handle(&mut app, key(KeyCode::Down)).await.unwrap();
+        handle(&mut app, key(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.input, "");
     }
 
     #[tokio::test]
     async fn esc_interrupts_only_while_a_task_runs() {
         let (mut app, _tx, _steer, cancel_rx, _cmd) = testui::app("keys-esc");
-        handle(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await.unwrap();
+        handle(&mut app, key(KeyCode::Esc)).await.unwrap();
         assert!(!*cancel_rx.borrow(), "idle Esc never cancels");
         app.task_running = true;
-        handle(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await.unwrap();
+        handle(&mut app, key(KeyCode::Esc)).await.unwrap();
         assert!(*cancel_rx.borrow(), "running Esc flips the cancel watch");
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_clears_a_typed_line_before_it_quits() {
+        let (mut app, ..) = testui::app("keys-ctrlc");
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        typed(&mut app, "half a thought").await;
+        handle(&mut app, ctrl_c).await.unwrap();
+        assert!(app.input.is_empty() && !app.quitting);
+        handle(&mut app, ctrl_c).await.unwrap();
+        assert!(app.quitting);
     }
 }

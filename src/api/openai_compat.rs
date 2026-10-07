@@ -2,6 +2,7 @@
 //! Providers with automatic prefix caching (DeepSeek-style) reward the §8.4
 //! stable-prefix discipline with no extra work here.
 
+use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -12,6 +13,11 @@ pub struct Client {
     http: reqwest::Client,
     key: String,
     base_url: String,
+    /// Sent with every request (gateway routing, metadata).
+    headers: Vec<(String, String)>,
+    /// `reasoning_effort` for thinking models (config `[models."<id>"]`).
+    reasoning_effort: Option<String>,
+    max_tokens: Option<u32>,
 }
 
 /// Accumulates one tool call from its streamed fragments.
@@ -22,22 +28,53 @@ struct ToolCallFrag {
     arguments: String,
 }
 
+/// A connection that can't be made in this long is a failed call.
+const CONNECT: Duration = Duration::from_secs(30);
+/// Until the response starts (headers): long prompts on slow models can
+/// take a while, so this is generous.
+const FIRST_BYTE: Duration = Duration::from_secs(180);
+/// Silence mid-stream past this is a stalled connection, not thinking:
+/// reasoning models stream their reasoning as they go.
+const STREAM_IDLE: Duration = Duration::from_secs(120);
+/// A whole non-streamed reply.
+const WHOLE: Duration = Duration::from_secs(300);
+/// A whole streamed reply: a model can keep a stream busy without ever
+/// finishing (a reasoning loop), which no idle timeout catches.
+const CALL_TOTAL: Duration = Duration::from_secs(600);
+/// Output tokens asked for when the model's options set none: without a
+/// cap some providers let one reply run to the model's whole limit.
+const DEFAULT_MAX_TOKENS: u32 = 16_384;
+
 impl Client {
+    /// Every wait is bounded, so a stalled connection becomes a retryable
+    /// error instead of a call that never returns.
     pub fn new(key: String, base_url: String) -> Client {
-        Client { http: reqwest::Client::new(), key, base_url }
+        let http = reqwest::Client::builder().connect_timeout(CONNECT).build().unwrap_or_default();
+        Client { http, key, base_url, headers: Vec::new(), reasoning_effort: None, max_tokens: None }
+    }
+
+    pub fn with_options(mut self, options: &crate::config::ModelOptions) -> Client {
+        self.reasoning_effort = options.reasoning_effort.clone();
+        self.max_tokens = options.max_tokens;
+        self
+    }
+
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Client {
+        self.headers = headers;
+        self
     }
 
     /// POST /chat/completions (stream: true), parse SSE deltas, forward text
     /// to `events`, accumulate the settled `Turn` with usage.
     pub async fn chat(&self, req: ChatRequest, events: mpsc::Sender<StreamEvent>) -> Result<Turn> {
-        let body = build_body(&req);
-        let mut resp = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.key)
-            .json(&body)
-            .send()
+        let body = build_body(&req, self.reasoning_effort.as_deref(), Some(self.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)));
+        let mut request = self.http.post(format!("{}/chat/completions", self.base_url)).bearer_auth(&self.key);
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
+        let mut resp = tokio::time::timeout(FIRST_BYTE, request.json(&body).send())
             .await
+            .map_err(|_| anyhow::anyhow!("chat request failed: no response in {}s", FIRST_BYTE.as_secs()))?
             .context("chat request failed")?;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -46,14 +83,81 @@ impl Client {
         }
 
         let mut stream = SseTurn::default();
+        let started = std::time::Instant::now();
         while !stream.done {
-            let Some(chunk) = resp.chunk().await? else { break };
+            if started.elapsed() > CALL_TOTAL {
+                anyhow::bail!("chat stream ran past {}s without finishing", CALL_TOTAL.as_secs());
+            }
+            let chunk = tokio::time::timeout(STREAM_IDLE, resp.chunk())
+                .await
+                .map_err(|_| anyhow::anyhow!("chat stream stalled: no data for {}s", STREAM_IDLE.as_secs()))??;
+            let Some(chunk) = chunk else { break };
             for event in stream.feed(&chunk) {
                 let _ = events.send(event).await;
             }
         }
-        Ok(stream.finish())
+        let reasoned = stream.reasoned;
+        let turn = stream.finish();
+        // Some providers' streaming parsers lose a reasoning model's tool call
+        // into the reasoning channel (Cloudflare's gpt-oss-20b: arguments in
+        // `reasoning_content`, no name, finish "stop"), leaving an empty turn.
+        // The same request without streaming comes back whole: retry it once.
+        if reasoned && turn.text.trim().is_empty() && turn.tool_calls.is_empty() {
+            tracing::warn!(model = %req.model, "empty streamed turn after reasoning — retrying without streaming");
+            let mut again = self.chat_whole(body).await?;
+            again.usage = add_usage(turn.usage, again.usage);
+            return Ok(again);
+        }
+        Ok(turn)
     }
+
+    /// The same request with `stream: false`.
+    async fn chat_whole(&self, mut body: Value) -> Result<Turn> {
+        body["stream"] = json!(false);
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("stream_options");
+        }
+        let mut request = self.http.post(format!("{}/chat/completions", self.base_url)).bearer_auth(&self.key);
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
+        let resp = request.json(&body).timeout(WHOLE).send().await.context("chat request failed")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(ApiError { status, body: crate::output::redact(&text) }.into());
+        }
+        Ok(whole_turn(&serde_json::from_str(&text).context("chat reply")?))
+    }
+}
+
+fn add_usage(a: Usage, b: Usage) -> Usage {
+    Usage { input_tokens: a.input_tokens + b.input_tokens, cached_tokens: a.cached_tokens + b.cached_tokens, output_tokens: a.output_tokens + b.output_tokens }
+}
+
+/// A non-streamed reply as a `Turn`, through the same fragment path as SSE.
+fn whole_turn(reply: &Value) -> Turn {
+    let mut turn = SseTurn::default();
+    if let Some(u) = reply.get("usage").filter(|u| !u.is_null()) {
+        turn.usage = parse_usage(u);
+    }
+    if let Some(reason) = reply.pointer("/choices/0/finish_reason").and_then(Value::as_str) {
+        turn.finish_reason = reason.to_string();
+    }
+    let message = reply.pointer("/choices/0/message").cloned().unwrap_or_default();
+    turn.text = message.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+    for call in message.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+        turn.frags.push(ToolCallFrag {
+            id: call.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+            name: call.pointer("/function/name").and_then(Value::as_str).unwrap_or("").to_string(),
+            arguments: match call.pointer("/function/arguments") {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            },
+        });
+    }
+    turn.finish()
 }
 
 /// One streamed response, assembled from raw SSE bytes.
@@ -68,6 +172,8 @@ struct SseTurn {
     finish_reason: String,
     /// `[DONE]` seen.
     done: bool,
+    /// Any reasoning text streamed (`reasoning_content` / `reasoning`).
+    reasoned: bool,
 }
 
 impl SseTurn {
@@ -94,6 +200,9 @@ impl SseTurn {
                 self.finish_reason = reason.to_string();
             }
             let Some(delta) = event.pointer("/choices/0/delta") else { continue };
+            if ["reasoning_content", "reasoning"].iter().any(|k| delta.get(*k).and_then(Value::as_str).is_some_and(|r| !r.is_empty())) {
+                self.reasoned = true;
+            }
             if let Some(t) = delta.get("content").and_then(Value::as_str) {
                 if !t.is_empty() {
                     self.text.push_str(t);
@@ -224,7 +333,7 @@ fn escape_raw_control_chars(raw: &str) -> String {
 
 /// Our Message enum → the OpenAI wire shape. The model id drops its provider
 /// prefix ("deepseek/deepseek-chat" → "deepseek-chat").
-fn build_body(req: &ChatRequest) -> Value {
+fn build_body(req: &ChatRequest, reasoning_effort: Option<&str>, max_tokens: Option<u32>) -> Value {
     let model = req.model.split_once('/').map(|(_, m)| m).unwrap_or(&req.model);
     let messages: Vec<Value> = req.messages.iter().map(to_wire).collect();
     let mut body = json!({
@@ -244,6 +353,12 @@ fn build_body(req: &ChatRequest) -> Value {
                 })
                 .collect(),
         );
+    }
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+    if let Some(n) = max_tokens {
+        body["max_tokens"] = json!(n);
     }
     body
 }
@@ -295,6 +410,17 @@ fn parse_usage(u: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_effort_is_sent_only_when_configured() {
+        let req = ChatRequest { model: "cloudflare/@cf/zai-org/glm-5.3".into(), messages: vec![Message::User("hi".into())], tools: vec![] };
+        let plain = build_body(&req, None, None);
+        assert_eq!(plain["model"], "@cf/zai-org/glm-5.3", "provider prefix stripped, rest kept");
+        assert!(plain.get("reasoning_effort").is_none() && plain.get("max_tokens").is_none());
+        let low = build_body(&req, Some("low"), Some(8192));
+        assert_eq!(low["reasoning_effort"], "low");
+        assert_eq!(low["max_tokens"], 8192);
+    }
 
     #[test]
     fn raw_control_chars_inside_strings_are_escaped_and_parse() {
@@ -349,6 +475,13 @@ mod tests {
         turn.feed(&sse(json!({"choices": [{"delta": {}, "finish_reason": "length"}]})));
         let call = &turn.finish().tool_calls[0];
         assert_eq!(call.name, "write");
+        // A non-streamed reply goes through the same path.
+        let whole = whole_turn(&json!({"choices": [{"finish_reason": "tool_calls", "message": {"content": null, "tool_calls": [
+            {"id": "c9", "function": {"name": "read", "arguments": "{\"reads\":[{\"file\":\"a\"}]}"}}]}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 3}}));
+        assert_eq!(whole.tool_calls[0].name, "read");
+        assert_eq!(whole.tool_calls[0].arguments["reads"][0]["file"], "a");
+        assert_eq!(whole.usage.output_tokens, 3);
         assert!(call.malformed.as_deref().is_some_and(|m| m.contains("token limit")), "{:?}", call.malformed);
 
         // Same broken JSON without a cut-off is reported as invalid JSON.

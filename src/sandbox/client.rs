@@ -119,6 +119,7 @@ impl Namespaced {
         env: Vec<(String, String)>,
         cwd: PathBuf,
         stdio: [OwnedFd; 3],
+        read_only: Option<protocol::ReadOnly>,
     ) -> Result<Proc> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (spawned_tx, spawned_rx) = oneshot::channel();
@@ -134,7 +135,7 @@ impl Namespaced {
         let raw: Vec<_> = stdio.iter().map(|fd| fd.as_raw_fd()).collect();
         {
             let _guard = self.send_lock.lock().unwrap();
-            protocol::send(self.sock.as_raw_fd(), &Request::Spawn { id, argv, env, cwd }, &raw)?;
+            protocol::send(self.sock.as_raw_fd(), &Request::Spawn { id, argv, env, cwd, read_only }, &raw)?;
         }
         drop(stdio);
         match spawned_rx.await {

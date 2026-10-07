@@ -27,8 +27,15 @@ pub struct RizinArgs {
     pub tail_lines: Option<usize>,
 }
 
+/// The last binary analyzed in this project, so a call without a session —
+/// a subagent's (sessions aren't shared), or after a resume — reopens it.
+fn last_binary_file(project: &std::path::Path) -> PathBuf {
+    project.join(".tursi/rizin-last")
+}
+
 pub async fn run(tb: &mut Toolbox, args: &Value) -> Result<String> {
     let args: RizinArgs = serde_json::from_value(args.clone())?;
+    let mut reopened = String::new();
 
     if let Some(path) = &args.open {
         if let Some(old) = tb.rizin.take() {
@@ -39,6 +46,13 @@ pub async fn run(tb: &mut Toolbox, args: &Value) -> Result<String> {
             anyhow::bail!("no such binary: {}", bin.display());
         }
         tb.rizin = Some(crate::rizin::Session::open(&tb.sandbox, &bin, args.deep.unwrap_or(false)).await?);
+        let _ = std::fs::write(last_binary_file(&tb.project), bin.display().to_string());
+    } else if tb.rizin.is_none() && !args.commands.is_empty() {
+        let last = std::fs::read_to_string(last_binary_file(&tb.project)).ok().map(|s| PathBuf::from(s.trim()));
+        if let Some(bin) = last.filter(|b| b.exists()) {
+            tb.rizin = Some(crate::rizin::Session::open(&tb.sandbox, &bin, false).await?);
+            reopened = format!("(no session was open — reopened {}, the last binary analyzed here)\n", bin.display());
+        }
     }
 
     let tail = args.tail_lines.unwrap_or(150);
@@ -47,7 +61,7 @@ pub async fn run(tb: &mut Toolbox, args: &Value) -> Result<String> {
         let session = tb
             .rizin
             .as_mut()
-            .ok_or_else(|| anyhow!("no rizin session — pass `open` with a binary path first"))?;
+            .ok_or_else(|| anyhow!("no rizin session and no binary analyzed here yet — pass `open` with a binary path"))?;
         if args.commands.is_empty() {
             out.push_str(&format!("rizin session open on {} (analyzed)\n", session.binary));
         }
@@ -73,5 +87,5 @@ pub async fn run(tb: &mut Toolbox, args: &Value) -> Result<String> {
         }
         out.push_str("(session closed)\n");
     }
-    Ok(out.trim_end().to_string())
+    Ok(format!("{reopened}{}", out.trim_end()))
 }

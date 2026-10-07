@@ -1,0 +1,9 @@
+{
+ "activity": "review",
+ "domain": "backend",
+ "difficulty": 1.55,
+ "protect": [
+  "cache.py"
+ ],
+ "prompt": "Review the change in change.diff, which is already applied to cache.py. Is it correct? Do not change any files. End your report with a line `VERDICT: correct` or `VERDICT: buggy`, and give file:line for any bug."
+}

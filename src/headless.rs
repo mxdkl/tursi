@@ -17,6 +17,13 @@ use crate::config::{Config, Secrets};
 use crate::session::Session;
 use crate::syscard::SystemCard;
 
+/// What a headless run does: one instruction, or a goal it works toward.
+pub enum Job {
+    Task(String),
+    Goal(String),
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     project: PathBuf,
     config: Config,
@@ -24,7 +31,7 @@ pub async fn run(
     card: SystemCard,
     session: Session,
     sandbox: crate::sandbox::Sandbox,
-    task: String,
+    job: Job,
     json: bool,
 ) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel::<UiEvent>(256);
@@ -54,9 +61,10 @@ pub async fn run(
     // mirror progress to stderr, and report each task's end together with
     // what's still armed — monitors keep a headless run alive (they time out
     // on their own, §monitor) until none remain.
-    let (done_tx, mut done_rx) = mpsc::channel::<(String, usize)>(8);
+    let (done_tx, mut done_rx) = mpsc::channel::<(String, usize, Option<f64>)>(8);
     let drain = tokio::spawn(async move {
         let mut armed = 0usize;
+        let mut balance: Option<f64> = None;
         while let Some(ev) = event_rx.recv().await {
             let indent = if ev.agent == ROOT { "" } else { "    " };
             match ev.kind {
@@ -74,11 +82,17 @@ pub async fn run(
                     eprintln!("{indent}  {} {name}: {first}", if is_error { '✗' } else { '✓' });
                 }
                 EventKind::Monitors { armed: list } => armed = list.len(),
-                EventKind::MonitorWoke { text } => eprintln!("  ⚡ {text}"),
+                EventKind::Balance { usd } => balance = Some(usd),
+                EventKind::GoalVerdict { verdict, reason } => eprintln!("  ◎ goal {verdict} — {reason}"),
+                EventKind::MonitorWoke { text } => eprintln!("  ⚡ {}", text.lines().next().unwrap_or("")),
+                EventKind::SubagentStarted { access, title, model, continued } => {
+                    eprintln!("  ▶ agent-{} {access} ({model}){}: {title}", ev.agent.0, if continued { " (follow-up)" } else { "" })
+                }
+                EventKind::SubagentFinished { ok, .. } => eprintln!("  ■ agent-{} {}", ev.agent.0, if ok { "finished" } else { "stopped" }),
                 EventKind::TaskDone { summary } if ev.agent != ROOT => eprintln!("{indent}  ● (subagent) {}", summary.lines().next().unwrap_or("")),
                 EventKind::TaskDone { summary } => {
                     eprintln!("  ● {summary}");
-                    let _ = done_tx.send((summary, armed)).await;
+                    let _ = done_tx.send((summary, armed, balance)).await;
                 }
                 _ => {}
             }
@@ -86,10 +100,17 @@ pub async fn run(
     });
 
     let started = Instant::now();
-    cmd_tx.send(Command::Task(task)).await?;
+    cmd_tx
+        .send(match job {
+            Job::Task(task) => Command::Task(task),
+            Job::Goal(condition) => Command::GoalSet(condition),
+        })
+        .await?;
     let mut summary = "(no completion)".to_string();
-    while let Some((s, armed)) = done_rx.recv().await {
+    let mut balance: Option<f64> = None;
+    while let Some((s, armed, bal)) = done_rx.recv().await {
         summary = s;
+        balance = bal.or(balance);
         if armed == 0 {
             break;
         }
@@ -114,6 +135,7 @@ pub async fn run(
                 "cached_tokens": s.cached_tokens,
                 "output_tokens": s.output_tokens,
                 "cost_usd": s.cost_usd,
+                "balance_usd": balance,
                 "wall_ms": wall_ms,
             })
         );

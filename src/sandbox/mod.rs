@@ -52,6 +52,41 @@ pub struct Options {
 #[derive(Clone)]
 pub struct Sandbox {
     inner: Arc<Inner>,
+    /// This handle's commands see the project read-only (the lead's, §5.7).
+    project_read_only: bool,
+}
+
+/// Build-output directories a read-only project keeps writable, so a lead
+/// or a reader can still build and test. These names are never anything
+/// else; change capture skips them too (`changes.rs`).
+pub(crate) const BUILD_DIRS: &[&str] = &[
+    "target", "node_modules", "_build", "zig-out", ".zig-cache", ".venv", "venv", "__pycache__", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", ".gradle", ".next", ".cache",
+];
+/// Names that are build output in one project and the deliverable in
+/// another (a benchmark's `out/`, a site's `dist/`): writable for a
+/// read-only project only when git ignores them, and always recorded.
+const MAYBE_BUILD_DIRS: &[&str] = &["build", "dist", "out", "coverage"];
+
+/// Directories a read-only project keeps writable: those of BUILD_DIRS
+/// that exist, and those of MAYBE_BUILD_DIRS that exist and git ignores.
+fn writable_dirs(project: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = BUILD_DIRS.iter().map(|d| project.join(d)).filter(|p| p.is_dir()).collect();
+    let maybe: Vec<&str> = MAYBE_BUILD_DIRS.iter().copied().filter(|d| project.join(d).is_dir()).collect();
+    if !maybe.is_empty() && project.join(".git").exists() {
+        // check-ignore prints the ignored ones of the paths it is given.
+        let ignored = std::process::Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(["check-ignore", "--"])
+            .args(maybe.iter().map(|d| format!("{d}/")))
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let ignored: Vec<&str> = ignored.lines().map(|l| l.trim().trim_end_matches('/')).collect();
+        out.extend(maybe.iter().filter(|d| ignored.contains(d)).map(|d| project.join(d)));
+    }
+    out
 }
 
 pub struct Inner {
@@ -322,7 +357,28 @@ impl Sandbox {
                 masks,
                 proxy,
             }),
+            project_read_only: false,
         }
+    }
+
+    /// The same sandbox, but commands run through this handle see the
+    /// project read-only, build-output directories excepted. Enforced by the
+    /// sandbox's mount namespace; a no-op unsandboxed.
+    pub fn with_read_only_project(&self) -> Sandbox {
+        Sandbox { inner: self.inner.clone(), project_read_only: true }
+    }
+
+    /// The per-spawn read-only spec: existing build directories stay
+    /// writable (`writable_dirs`). A Rust project's `target/` is created
+    /// first so the lead's first `cargo test` works.
+    fn read_only_spec(&self) -> Option<protocol::ReadOnly> {
+        if !self.project_read_only {
+            return None;
+        }
+        if self.project.join("Cargo.toml").is_file() {
+            let _ = std::fs::create_dir_all(self.project.join("target"));
+        }
+        Some(protocol::ReadOnly { project: self.project.clone(), writable: writable_dirs(&self.project) })
     }
 
     pub fn sandboxed(&self) -> bool {
@@ -366,7 +422,7 @@ impl Sandbox {
                 let (stdin_child, stdin_ours) = child_end(spawn.stdin, true)?;
                 let (stdout_child, stdout_ours) = child_end(spawn.stdout, false)?;
                 let (stderr_child, stderr_ours) = child_end(spawn.stderr, false)?;
-                let proc = ns.spawn(spawn.argv, env, cwd, [stdin_child, stdout_child, stderr_child]).await?;
+                let proc = ns.spawn(spawn.argv, env, cwd, [stdin_child, stdout_child, stderr_child], self.read_only_spec()).await?;
                 Ok(Child {
                     stdin: stdin_ours.map(|fd| Ok::<In, anyhow::Error>(Box::new(tokio::net::unix::pipe::Sender::from_owned_fd(fd)?))).transpose()?,
                     stdout: stdout_ours.map(|fd| Ok::<Out, anyhow::Error>(Box::new(tokio::net::unix::pipe::Receiver::from_owned_fd(fd)?))).transpose()?,
@@ -798,6 +854,51 @@ mod tests {
         assert!(results.iter().all(|r| r.exit_code == Some(0)), "all steps green");
         assert_eq!(results[1].stdout.trim(), "42");
         assert!(results[4].stdout.trim().ends_with("/sub"));
+    }
+
+    #[tokio::test]
+    async fn a_read_only_handle_cannot_write_the_project_but_can_build() {
+        let dir = tmp("ro");
+        std::fs::write(dir.join("a.txt"), "before").unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        // `out/` could be the deliverable: read-only unless git ignores it,
+        // as `build/` is here.
+        for d in ["out", "build"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(dir.join(".gitignore"), "build/\n").unwrap();
+        let git = std::process::Command::new("git").arg("-C").arg(&dir).args(["init", "-q"]).status();
+        assert!(git.is_ok_and(|s| s.success()));
+        assert_eq!(writable_dirs(&dir), vec![dir.join("target"), dir.join("build")]);
+        let sbx = Sandbox::for_tests(&dir);
+        if !sbx.sandboxed() {
+            return; // unsandboxed hosts cannot enforce it
+        }
+        let lead = sbx.with_read_only_project();
+        let r = lead
+            .run_steps(
+                vec![
+                    step("echo after > a.txt", 10),
+                    step("python3 -c \"open('b.txt','w').write('x')\" || echo blocked", 10),
+                    step("echo built > target/out && cat target/out", 10),
+                    step("cat a.txt", 10),
+                    step("echo x > out/result.json || echo blocked", 10),
+                ],
+                OnError::Continue,
+            )
+            .await
+            .unwrap();
+        assert_ne!(r[0].exit_code, Some(0), "shell redirect refused");
+        assert!(r[0].stderr.contains("Read-only file system"), "{}", r[0].stderr);
+        assert!(r[1].stdout.contains("blocked"), "interpreters are refused too");
+        assert_eq!(r[2].stdout.trim(), "built", "build output stays writable: {}", r[2].stderr);
+        assert_eq!(r[3].stdout.trim(), "before");
+        assert!(r[4].stdout.contains("blocked"), "a deliverable out/ is read-only: {}", r[4].stdout);
+        assert!(!dir.join("b.txt").exists());
+        // The ordinary handle on the same sandbox still writes.
+        let w = sbx.run_steps(vec![step("echo after > a.txt", 10)], OnError::Stop).await.unwrap();
+        assert_eq!(w[0].exit_code, Some(0), "{}", w[0].stderr);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap().trim(), "after");
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@
 
 Threat model: a well-meaning model that hostile project content can steer (a README or
 test fixture instructing it to fetch or exfiltrate). Both mistakes and injection must stay
-inside the wall. Inside the project, protection is behavioral (§5) plus edit checkpoints.
+inside the wall. Inside the project, protection is behavioral (§5) plus recorded changes (SPEC §3.3).
 
 ## 1. Modes and questions
 
@@ -124,6 +124,17 @@ are absent because they are never mounted.
 
 Notes:
 
+- **Readers see the project read-only.** Every command of a subagent that declared no
+  write areas (a reader), background ones included, gets a private mount namespace in
+  which the project is read-only. The init sets it up in the forked child before the
+  workload joins its namespace and loses mount rights, so nothing the command runs can
+  undo it. Build-output directories that exist (`target/`, `node_modules/`, `.venv/`,
+  caches) stay writable; `build/`, `dist/`, `out/` and `coverage/` stay writable only when
+  git ignores them, because elsewhere they are often the deliverable. A writer (a subagent
+  with declared areas, or the agent working on the user's own message) keeps the writable
+  project; declared areas are advisory: other agents are warned off them, not blocked.
+  Unsandboxed (`--no-sandbox`) a reader is held back only by its missing `edit`/`write`
+  tools.
 - The model never sees the `/tmp` indirection: inside, `/tmp` is `/tmp`.
 - **`$HOME` is throwaway.** Tools may write dotfiles and caches there (`~/.cache/...`,
   shell history); nothing of the real home shows and nothing persists except through the
@@ -171,7 +182,7 @@ and 443), `.suffix` (the domain and every subdomain), or `host:port`.
 
 - **Root:** the directory tursi starts in — unless an ancestor already has a `.tursi/`
   directory, in which case that ancestor is the project. No git repository is required.
-- **State** lives in `<project>/.tursi/` (sessions, logs, checkpoints, project config). If
+- **State** lives in `<project>/.tursi/` (the ledger and its blobs, project config). If
   the project happens to be a git repo, tursi adds `.tursi/` to `.git/info/exclude` so
   `git status` stays clean — the only thing tursi ever does to a repository, and it is a
   plain file append, not a git command.
@@ -197,8 +208,9 @@ reviewable as a branch; the sandbox still guarantees nothing escapes the project
 
 ### 5.3 Without git: in place
 
-The agent edits the project directly. Protection is the edit-tool checkpoints (`:rewind`,
-SPEC §3.3) and the must-ask rule for destructive steps (§1.2). No snapshots.
+The agent edits the project directly. Every change is recorded in the ledger with its
+before-state (SPEC §3.3), and the must-ask rule covers destructive steps (§1.2). There
+is no undo command.
 
 ### 5.4 `.git/hooks` and `.git/config` are read-only
 

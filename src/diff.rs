@@ -94,6 +94,52 @@ enum Op {
     Add(usize),
 }
 
+/// One hunk of an exact line edit script: replace `.1` old lines starting
+/// at old line `.0` (0-based) with the text `.2`.
+pub type Hunk = (usize, usize, String);
+
+/// An exact edit script old → new (the ledger's stored changes, §3.3).
+/// Lines keep their endings, so `apply` reproduces `new` byte for byte.
+pub fn script(old: &str, new: &str) -> Vec<Hunk> {
+    let o: Vec<&str> = old.split_inclusive('\n').collect();
+    let n: Vec<&str> = new.split_inclusive('\n').collect();
+    let mut hunks = Vec::new();
+    let mut cur: Option<Hunk> = None;
+    let mut consumed = 0;
+    for op in ops(&o, &n) {
+        match op {
+            Op::Keep(i, _) => {
+                hunks.extend(cur.take());
+                consumed = i + 1;
+            }
+            Op::Del(i) => {
+                cur.get_or_insert((consumed, 0, String::new())).1 += 1;
+                consumed = i + 1;
+            }
+            Op::Add(j) => cur.get_or_insert((consumed, 0, String::new())).2.push_str(n[j]),
+        }
+    }
+    hunks.extend(cur);
+    hunks
+}
+
+/// `old` with `script` applied; None if the script doesn't fit `old`.
+pub fn apply(old: &str, script: &[Hunk]) -> Option<String> {
+    let o: Vec<&str> = old.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(old.len());
+    let mut cursor = 0;
+    for (at, del, ins) in script {
+        if *at < cursor || at + del > o.len() {
+            return None;
+        }
+        o[cursor..*at].iter().for_each(|l| out.push_str(l));
+        out.push_str(ins);
+        cursor = at + del;
+    }
+    o[cursor..].iter().for_each(|l| out.push_str(l));
+    Some(out)
+}
+
 /// Edit script old → new: common prefix/suffix trimmed, LCS on the middle
 /// (plain deletions + additions when the middle is too big to table).
 fn ops(o: &[&str], n: &[&str]) -> Vec<Op> {
@@ -148,6 +194,27 @@ fn ops(o: &[&str], n: &[&str]) -> Vec<Op> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scripts_reproduce_the_new_text_exactly() {
+        let cases = [
+            ("a\nb\nc\n", "a\nB\nc\n"),
+            ("a\nb\nc\n", "x\na\nb\nc\ny\n"),
+            ("a\nb\nc\n", "a\nc\n"),
+            ("a\nb", "a\nb\n"),
+            ("", "fresh\nfile"),
+            ("gone\n", ""),
+            ("same\n", "same\n"),
+            ("1\n2\n3\n4\n5\n6\n", "1\ntwo\n3\n4\nfive\n6\n7\n"),
+        ];
+        for (old, new) in cases {
+            let s = script(old, new);
+            assert_eq!(apply(old, &s).as_deref(), Some(new), "{old:?} → {new:?} via {s:?}");
+        }
+        assert!(script("same\n", "same\n").is_empty());
+        assert_eq!(script("a\nb\nc\n", "a\nB\nc\n"), vec![(1, 1, "B\n".to_string())]);
+        assert!(apply("short\n", &[(5, 1, String::new())]).is_none());
+    }
 
     #[test]
     fn a_middle_change_gets_numbers_context_and_counts() {

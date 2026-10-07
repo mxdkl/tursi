@@ -1,0 +1,9 @@
+{
+ "activity": "test",
+ "domain": "backend",
+ "difficulty": 1.88,
+ "protect": [
+  "intervals.py"
+ ],
+ "prompt": "Write thorough unit tests for merge() in intervals.py, in a new file test_intervals.py using unittest. Cover overlapping, touching, nested, unsorted and empty input. Do not change intervals.py. Run the tests."
+}

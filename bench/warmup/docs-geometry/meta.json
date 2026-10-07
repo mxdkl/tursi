@@ -1,0 +1,9 @@
+{
+ "activity": "writing",
+ "domain": "prose",
+ "difficulty": 1.45,
+ "protect": [
+  "test_geometry.py"
+ ],
+ "prompt": "Add a docstring to every public function in geometry.py: a one-line summary, then what each argument is and what it returns. Do not change behavior; run `python3 -m unittest -q` afterwards."
+}

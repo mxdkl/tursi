@@ -194,7 +194,7 @@ mod tests {
 }
 
 impl SystemCard {
-    /// ~200-token block for the system prompt; also shown by `:sysinfo`.
+    /// ~200-token block for the system prompt; also shown by `/sysinfo`.
     pub fn render(&self) -> String {
         let opt_i32 = |v: Option<i32>| v.map_or("?".to_string(), |x| x.to_string());
         let opt_u32 = |v: Option<u32>| v.map_or("?".to_string(), |x| x.to_string());

@@ -1,4 +1,4 @@
-//! read / write / edit: staleness hashes, checkpoints, per-file transactions
+//! read / write / edit: staleness hashes, recorded changes, per-file transactions
 //! (§3, §4.1).
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::bus::{EventKind, UiHandle};
+use crate::bus::UiHandle;
 use crate::tools::Toolbox;
 
 /// Per-agent read-state: full-file staleness hash + what range is in context
@@ -84,6 +84,49 @@ pub struct WriteArgs {
     pub content: String,
 }
 
+/// Where an edit that didn't match probably meant: the window of the file
+/// whose lines agree best with `old` (ignoring whitespace), shown numbered
+/// as it is now, so the retry can copy exact text instead of re-reading.
+fn near_miss(text: &str, old: &str) -> String {
+    let key = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let file: Vec<&str> = text.lines().collect();
+    let want: Vec<String> = old.lines().map(key).collect();
+    let n = want.len().max(1);
+    let mut index: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    for (i, line) in file.iter().enumerate() {
+        let k = key(line);
+        if k.len() >= 4 {
+            index.entry(k).or_default().push(i);
+        }
+    }
+    let mut starts = std::collections::BTreeSet::new();
+    for (j, k) in want.iter().enumerate() {
+        for &i in index.get(k).map(Vec::as_slice).unwrap_or(&[]) {
+            if i >= j && starts.len() < 4000 {
+                starts.insert(i - j);
+            }
+        }
+    }
+    let score = |s: usize| (0..n).filter(|&j| file.get(s + j).is_some_and(|l| key(l) == want[j])).count();
+    let Some((best, start)) = starts.iter().map(|&s| (score(s), s)).max_by_key(|&(sc, s)| (sc, std::cmp::Reverse(s))) else {
+        return "no line of it appears in the file, even ignoring whitespace; re-read the region you meant".to_string();
+    };
+    let end = (start + n).min(file.len());
+    let width = end.to_string().len();
+    let shown: Vec<String> = file[start..end]
+        .iter()
+        .take(40)
+        .enumerate()
+        .map(|(k, l)| format!("{:>width$}→{}", start + k + 1, l.chars().take(200).collect::<String>()))
+        .collect();
+    let head = if best == n {
+        format!("lines {}–{} match except for whitespace; the exact text is:", start + 1, end)
+    } else {
+        format!("closest match is lines {}–{} ({best} of {n} lines agree), as the file has them now:", start + 1, end)
+    };
+    format!("{head}\n{}", shown.join("\n"))
+}
+
 /// Batched, ranged, line-numbered; explicit truncation marker; records the
 /// staleness hash. Unchanged content whose range is already in context
 /// returns `unchanged since turn N` instead of the bytes (§4).
@@ -143,6 +186,7 @@ pub async fn read(tb: &mut Toolbox, args: &Value) -> Result<String> {
                 MAX_READ_BYTES / 1024
             ));
         }
+        tb.changes.lock().unwrap().note_read(tb.agent, &path);
         tb.fs.reads.insert(
             path,
             ReadRecord { file_hash: hash, turn: tb.turn, offset, limit: Some(limit), in_context: true },
@@ -158,12 +202,28 @@ fn covers(rec: &ReadRecord, offset: u32, limit: u32, total: u32) -> bool {
     rec.offset <= offset && rec_end >= req_end
 }
 
-/// New files are free (plus an "absent" checkpoint so rewind deletes them);
+/// A note when another agent declared it writes this area (a fork's subtask,
+/// §5.8): advice, not a lock — the edit already happened.
+fn claimed_note(tb: &Toolbox, path: &std::path::Path) -> String {
+    match tb.changes.lock().unwrap().claimed_by_other(tb.agent, path) {
+        Some((agent, area)) => format!(
+            " — note: agent-{agent} is working in {} right now; changes here may collide with its work",
+            area.strip_prefix(&tb.project).unwrap_or(&area).display()
+        ),
+        None => String::new(),
+    }
+}
+
+/// New files are free (recorded as created, §3.3);
 /// overwriting requires a prior, still-fresh read this session (§4.1).
-pub async fn write(tb: &mut Toolbox, args: &Value, ui: &UiHandle) -> Result<String> {
+pub async fn write(tb: &mut Toolbox, args: &Value, _ui: &UiHandle) -> Result<String> {
     let args: WriteArgs = serde_json::from_value(args.clone())?;
+    if crate::agent::prompt::is_history_placeholder(&args.content) {
+        bail!("that is a placeholder from your compacted history, not file content — write the real text");
+    }
     let path = tb.sandbox.resolve(&args.file, true)?;
-    let old = if path.exists() {
+    let existed = path.exists();
+    let old = if existed {
         let rec = tb.fs.reads.get(&path).ok_or_else(|| {
             anyhow!("{} exists — read it before overwriting", args.file.display())
         })?;
@@ -179,15 +239,15 @@ pub async fn write(tb: &mut Toolbox, args: &Value, ui: &UiHandle) -> Result<Stri
         String::new()
     };
 
-    tb.checkpoints.lock().unwrap().snapshot(tb.task, &path)?;
     std::fs::write(&path, &args.content)?;
-    ui.send(EventKind::FileDiff(crate::diff::diff(&args.file.display().to_string(), &old, &args.content))).await;
+    tb.changes.lock().unwrap().record(tb.agent, tb.task, &path, existed.then_some(old.as_bytes()), Some(args.content.as_bytes()), "write")?;
     let hash = blake3::hash(args.content.as_bytes());
     tb.fs.reads.insert(
         path.clone(),
         ReadRecord { file_hash: hash, turn: tb.turn, offset: 1, limit: None, in_context: true },
     );
     let mut line = format!("wrote {} ({} lines)", args.file.display(), args.content.lines().count());
+    line.push_str(&claimed_note(tb, &path));
     // Output tokens are the expensive ones: re-sending a whole file to change
     // a few lines is the single costliest habit. Say so, with numbers.
     if !old.is_empty() {
@@ -211,7 +271,7 @@ pub async fn write(tb: &mut Toolbox, args: &Value, ui: &UiHandle) -> Result<Stri
 }
 
 /// Hunks grouped by file; each file's hunks validate together and apply as
-/// one mutation — one checkpoint, one diagnostics run (§3.1). A failing hunk fails its file's transaction; files already
+/// one mutation — one recorded change, one diagnostics run (§3.1). A failing hunk fails its file's transaction; files already
 /// applied stand (independence per §3.1).
 pub async fn edit(tb: &mut Toolbox, args: &Value, ui: &UiHandle) -> Result<String> {
     let args: EditArgs = serde_json::from_value(args.clone())?;
@@ -245,8 +305,8 @@ fn group_by_file(hunks: Vec<Hunk>) -> Vec<(PathBuf, Vec<Hunk>)> {
 }
 
 /// One file's transaction: stale-check → validate all hunks on a working
-/// copy → checkpoint → write → diagnostics.
-async fn apply_file_transaction(tb: &mut Toolbox, file: &PathBuf, hunks: Vec<Hunk>, ui: &UiHandle) -> Result<String> {
+/// copy → write → record → diagnostics.
+async fn apply_file_transaction(tb: &mut Toolbox, file: &PathBuf, hunks: Vec<Hunk>, _ui: &UiHandle) -> Result<String> {
     let path = tb.sandbox.resolve(file, true)?;
     let original = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {}", file.display()))?;
@@ -277,35 +337,55 @@ async fn apply_file_transaction(tb: &mut Toolbox, file: &PathBuf, hunks: Vec<Hun
         } else {
             (hunk.old_string.clone(), hunk.new_string.clone())
         };
+        if crate::agent::prompt::is_history_placeholder(&hunk.old_string)
+            || crate::agent::prompt::is_history_placeholder(&hunk.new_string)
+        {
+            bail!(
+                "hunk {}: that is a placeholder from your compacted history, not file text — re-read the \
+                 file and use its real contents",
+                i + 1
+            );
+        }
         let count = work.matches(&old).count();
         if hunk.replace_all.unwrap_or(false) {
             if count == 0 {
-                bail!("hunk {}: old_string not found", i + 1);
+                bail!("hunk {}: old_string not found — {}", i + 1, near_miss(&work, &hunk.old_string));
             }
             work = work.replace(&old, &new);
         } else {
             match count {
-                0 => bail!("hunk {}: old_string not found", i + 1),
+                0 => bail!("hunk {}: old_string not found — {}", i + 1, near_miss(&work, &hunk.old_string)),
                 1 => work = work.replacen(&old, &new, 1),
-                n => bail!("hunk {}: {n} matches — make old_string unique", i + 1),
+                n => {
+                    let lines: Vec<String> = work
+                        .match_indices(&old)
+                        .take(6)
+                        .map(|(at, _)| (work[..at].matches('\n').count() + 1).to_string())
+                        .collect();
+                    bail!(
+                        "hunk {}: {n} matches (starting at lines {}) — make old_string unique, or set replace_all",
+                        i + 1,
+                        lines.join(", ")
+                    )
+                }
             }
         }
     }
 
     let new_hash = blake3::hash(work.as_bytes());
-    let oscillated = tb.checkpoints.lock().unwrap().seen(tb.task, &path, new_hash);
+    let oscillated = tb.changes.lock().unwrap().seen(tb.agent, tb.task, &path, new_hash);
 
-    tb.checkpoints.lock().unwrap().snapshot(tb.task, &path)?;
     std::fs::write(&path, &work)?;
-    ui.send(EventKind::FileDiff(crate::diff::diff(&file.display().to_string(), &original, &work))).await;
+    tb.changes.lock().unwrap().record(tb.agent, tb.task, &path, Some(original.as_bytes()), Some(work.as_bytes()), "edit")?;
     tb.fs.reads.insert(
         path.clone(),
         ReadRecord { file_hash: new_hash, turn: tb.turn, offset: rec.offset, limit: rec.limit, in_context: rec.in_context },
     );
 
     let mut line = format!("applied {} hunk(s) to {}", hunks.len(), file.display());
+    line.push_str(&claimed_note(tb, &path));
     if oscillated {
-        line.push_str(" — note: result matches an earlier checkpoint (undo loop?)");
+        line.push_str(" — note: the file was in exactly this state earlier in this task (undo loop?)");
     }
     // The result as it now reads, numbered, so the model needn't re-read the
     // file to check its work — a re-read is a whole round trip.
@@ -399,15 +479,20 @@ mod tests {
             lsp: crate::lsp::Manager::new(dir.to_path_buf(), Default::default(), sandbox.clone()),
             debugger: None,
         rizin: None,
-            checkpoints: std::sync::Arc::new(std::sync::Mutex::new(crate::checkpoint::Store::open(dir, uuid::Uuid::now_v7()).unwrap())),
+            changes: std::sync::Arc::new(std::sync::Mutex::new(crate::changes::Changes::open(dir))),
             custom: crate::tools::custom::Registry { entries: vec![] },
             mask: None,
+            writes: None,
+            denied: &[],
             subagents: None,
             monitors: crate::monitor::Manager::new(sandbox.clone()).0,
+            decider: None,
             afk: false,
             lsp_check_edits: false,
             task: 1,
             turn: 1,
+            split: None,
+            fork: None,
         };
         (tb, UiHandle { agent: ROOT, tx }, rx)
     }
@@ -564,6 +649,59 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_missed_edit_shows_where_it_probably_meant() {
+        let dir = tmp("edit-near-miss");
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n\nfn step(x: u32) -> u32 {\n    let y = x + 1;\n    y * 2\n}\n\nfn b() { 1 }\nfn b() { 1 }\n").unwrap();
+        let (mut tb, ui, _rx) = toolbox(&dir);
+        read_file(&mut tb, "a.rs").await;
+        // Same lines, different indentation: the exact text comes back.
+        let err = edit(&mut tb, &serde_json::json!({"edits": [{"file": "a.rs", "old_string": "fn step(x: u32) -> u32 {\n  let y = x + 1;", "new_string": "z"}]}), &ui)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lines 3–4 match except for whitespace") && err.contains("4→    let y = x + 1;"), "{err}");
+        // One line wrong: the closest window, numbered.
+        let err = edit(&mut tb, &serde_json::json!({"edits": [{"file": "a.rs", "old_string": "    let y = x + 2;\n    y * 2\n}", "new_string": "z"}]}), &ui)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("closest match is lines 4–6 (2 of 3 lines agree)") && err.contains("4→    let y = x + 1;"), "{err}");
+        let err = edit(&mut tb, &serde_json::json!({"edits": [{"file": "a.rs", "old_string": "nothing like it", "new_string": "z"}]}), &ui)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no line of it appears"), "{err}");
+        let err = edit(&mut tb, &serde_json::json!({"edits": [{"file": "a.rs", "old_string": "fn b() { 1 }", "new_string": "z"}]}), &ui)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 matches (starting at lines 8, 9)"), "{err}");
+        // A compaction placeholder is never written into a file.
+        let err = edit(&mut tb, &serde_json::json!({"edits": [{"file": "a.rs", "old_string": "fn a() {}", "new_string": "⟨elided from history: 3 lines, already applied — not file text⟩"}]}), &ui)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("placeholder"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rizin_without_a_session_reopens_the_last_binary() {
+        if crate::lsp::which("rizin").is_none() {
+            return;
+        }
+        let dir = tmp("rizin-reopen");
+        let (mut tb, _ui, _rx) = toolbox(&dir);
+        let err = crate::tools::rizin::run(&mut tb, &serde_json::json!({"commands": ["i"]})).await.unwrap_err();
+        assert!(err.to_string().contains("no binary analyzed here yet"), "{err}");
+        std::fs::copy("/bin/true", dir.join("prog")).unwrap();
+        crate::tools::rizin::run(&mut tb, &serde_json::json!({"open": "prog"})).await.unwrap();
+        // A fresh toolbox (a subagent, or after a resume) has no session.
+        let (mut fresh, _ui, _rx) = toolbox(&dir);
+        let out = crate::tools::rizin::run(&mut fresh, &serde_json::json!({"commands": ["i~format"]})).await.unwrap();
+        assert!(out.starts_with("(no session was open — reopened") && out.contains("prog"), "{out}");
     }
 
     #[tokio::test]

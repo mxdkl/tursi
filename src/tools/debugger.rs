@@ -53,7 +53,7 @@ pub enum Action {
 
 /// Execute in order, stop on first error (§4.3). Session-creating actions
 /// fill `tb.debugger`; the rest require it live. Resuming actions return
-/// compact stop reports, never the raw transcript (which goes to debug.log).
+/// compact stop reports, never the raw transcript (which goes to the ledger).
 pub async fn run(tb: &mut Toolbox, args: &Value) -> Result<String> {
     use crate::dap::{Session, StepKind};
     let args: DebugArgs = serde_json::from_value(args.clone())?;
@@ -219,7 +219,7 @@ fn render_where(stack: &str) -> String {
     stack.lines().take(3).collect::<Vec<_>>().join("\n")
 }
 
-/// Flush the target's remaining output to debug.log, then close the session.
+/// Flush the target's remaining output to the ledger, then close the session.
 async fn flush_output(tb: &Toolbox, mut session: crate::dap::Session) -> Result<String> {
     let output = session.take_output();
     session.quit().await?;

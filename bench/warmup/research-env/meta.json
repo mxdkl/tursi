@@ -1,0 +1,7 @@
+{
+ "activity": "research",
+ "domain": "backend",
+ "difficulty": 1.58,
+ "protect": [],
+ "prompt": "Read-only question; do not change any files. Find every place in this project's code that reads the APP_TOKEN environment variable (not other variables, not documentation). End your report with a line `READERS:` followed by one file:line per reader, one per line, and nothing after."
+}

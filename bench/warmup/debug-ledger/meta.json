@@ -1,0 +1,9 @@
+{
+ "activity": "debug",
+ "domain": "backend",
+ "difficulty": 1.54,
+ "protect": [
+  "test_ledger.py"
+ ],
+ "prompt": "The tests in test_ledger.py fail. Find and fix the bug in ledger.py (do not change the tests), then run `python3 -m unittest -q` to confirm."
+}

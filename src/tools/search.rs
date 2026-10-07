@@ -1,11 +1,10 @@
 //! search (ripgrep-backed) and log_search (§4.1) — read-only. ripgrep runs
 //! inside the sandbox, so it sees exactly the model's view; log_search reads
-//! the harness's own debug.log.
+//! the harness's own ledger.
 
 use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeSet;
 
 use crate::tools::Toolbox;
 
@@ -103,55 +102,13 @@ pub async fn search(tb: &Toolbox, args: &Value) -> Result<String> {
     Ok(rendered.trim_end().to_string())
 }
 
-/// Substring grep over this session's full debug.log with context windows —
-/// the recovery path that makes aggressive truncation safe (§4). `log#N` ids
-/// from tool results are directly addressable.
+/// Substring grep over every tool output in the project ledger, newest
+/// first, with context windows — the recovery path that makes aggressive
+/// truncation safe (§4). `log#N` ids from tool results fetch that output.
 pub async fn log_search(tb: &Toolbox, args: &Value) -> Result<String> {
     let args: LogSearchArgs = serde_json::from_value(args.clone())?;
     let ctx = args.context_lines.unwrap_or(2).min(20);
-    let path = tb.project.join(".tursi/debug.log");
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    if content.is_empty() {
-        return Ok("the session log is empty".to_string());
-    }
-
-    const MAX_MATCHES: usize = 20;
-    let lines: Vec<&str> = content.lines().collect();
-    let mut keep = BTreeSet::new();
-    let mut matches = 0usize;
-    let mut more = false;
-    for (i, line) in lines.iter().enumerate() {
-        if line.contains(&args.pattern) {
-            matches += 1;
-            if matches > MAX_MATCHES {
-                more = true;
-                break;
-            }
-            for j in i.saturating_sub(ctx)..=(i + ctx).min(lines.len() - 1) {
-                keep.insert(j);
-            }
-        }
-    }
-    if keep.is_empty() {
-        return Ok("no matches in the session log".to_string());
-    }
-
-    let mut out = String::new();
-    let mut last: Option<usize> = None;
-    for &i in &keep {
-        if let Some(prev) = last {
-            if i > prev + 1 {
-                out.push_str(&format!("· · · ({} lines elided)\n", i - prev - 1));
-            }
-        }
-        out.push_str(lines[i]);
-        out.push('\n');
-        last = Some(i);
-    }
-    if more {
-        out.push_str("… more matches exist — refine the pattern\n");
-    }
-    Ok(out.trim_end().to_string())
+    Ok(crate::ledger::for_project(&tb.project).search(&args.pattern, ctx, 20))
 }
 
 #[cfg(test)]

@@ -1,7 +1,10 @@
-//! Ratatui TUI: hand-rolled modal layer per the newbbs pattern (§2). The UI
+//! Ratatui TUI (§2): a small chat with the lead and, once subagents spin up,
+//! a grid of tiles showing each one at work. No modes: typing always goes to
+//! the input, `/` starts a command. Tool calls never reach the chat. The UI
 //! owns the terminal and the App; the agent runs in its own task and talks
 //! over the bus. Keys arrive from a blocking reader thread — no extra deps.
 
+pub mod agents;
 pub mod command;
 pub mod keys;
 pub mod render;
@@ -16,14 +19,7 @@ use crate::bus::{ApprovalRequest, AskRequest, EventKind, ROOT, UiEvent, UiHandle
 use crate::config::{Config, Secrets};
 use crate::session::Session;
 use crate::syscard::SystemCard;
-use transcript::{Entry, ToolResult};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Normal,
-    Insert,
-    Command,
-}
+use transcript::Entry;
 
 pub enum Overlay {
     /// The network prompt (PERMISSIONS.md §4.3): y / n(+reason).
@@ -37,15 +33,14 @@ pub enum Overlay {
 }
 
 pub struct App {
-    // Modal state (newbbs pattern).
-    pub mode: Mode,
     pub input: String,
     pub cursor: usize,
-    pub command: String,
+    /// Sent inputs, oldest first, for Up/Down recall; `history_pos` indexes
+    /// it while recalling.
+    pub history: Vec<String>,
+    pub history_pos: Option<usize>,
     pub status: Option<String>,
     pub scroll: usize,
-    /// Two-key sequences; `gg` is the only one.
-    pub pending: Option<char>,
     pub overlay: Option<Overlay>,
     pub quitting: bool,
 
@@ -56,8 +51,13 @@ pub struct App {
     pub stubs: Option<(usize, usize)>,
     /// Armed monitors `(id, label)` for the status bar.
     pub monitors: Vec<(String, String)>,
+    /// Active goal: (condition, since, evaluated turns, last reason).
+    pub goal: Option<(String, std::time::Instant, u32, Option<String>)>,
     pub session_usd: f64,
     pub month_usd: f64,
+    /// Provider balance, when the provider exposes one; shown instead of
+    /// the cost arithmetic.
+    pub balance_usd: Option<f64>,
     /// Context-window gauge for the header: estimated transcript tokens and the
     /// window size (§8).
     pub ctx_used: u64,
@@ -69,8 +69,12 @@ pub struct App {
     /// Model text streamed for the current block, not yet closed by a tool
     /// call or the task end.
     pub partial: String,
-    /// Ctrl+O: show every line of tool results instead of the first few.
-    pub verbose: bool,
+    /// The lead's tool calls this task — counted, never shown.
+    pub lead_steps: usize,
+    /// Every subagent this session, for the agent field (`ui::agents`).
+    pub tiles: Vec<agents::Tile>,
+    /// Animation clock for the agent field.
+    pub clock: std::time::Instant,
     /// When the running task started and the session spend then, for the
     /// `✻` footer's elapsed time and per-task cost.
     pub task_started: Option<std::time::Instant>,
@@ -134,28 +138,31 @@ pub async fn run(
 
     let model = config.model.clone();
     let mut app = App {
-        mode: Mode::Normal,
         input: String::new(),
         cursor: 0,
-        command: String::new(),
-        status: Some("i to type, : for commands, :help for the keymap".to_string()),
+        history: Vec::new(),
+        history_pos: None,
+        status: None,
         scroll: 0,
-        pending: None,
         overlay: None,
         quitting: false,
         afk,
         plan_active: false,
         stubs: None,
         monitors: Vec::new(),
+        goal: None,
         session_usd: 0.0,
         month_usd: 0.0,
+        balance_usd: None,
         ctx_used: 0,
         ctx_window: crate::agent::prompt::DEFAULT_CONTEXT_WINDOW,
         model,
         task_running: false,
         transcript: Vec::new(),
         partial: String::new(),
-        verbose: false,
+        lead_steps: 0,
+        tiles: Vec::new(),
+        clock: std::time::Instant::now(),
         task_started: None,
         task_start_usd: 0.0,
         view_height: 24,
@@ -170,13 +177,8 @@ pub async fn run(
 
     if app.session.resumed {
         // Replay what the model remembers, so the screen matches its context.
-        let path = Session::transcript_path(&project, app.session.id);
-        if let Some(messages) = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .and_then(|v| serde_json::from_value::<Vec<crate::api::Message>>(v.get("messages")?.clone()).ok())
-        {
-            app.transcript = transcript::from_messages(&messages);
+        if let Some(conv) = crate::ledger::for_project(&project).conversation(app.session.id, crate::bus::ROOT) {
+            app.transcript = transcript::from_messages(&conv.messages);
         }
         app.transcript.push(Entry::Note(format!("── resumed session {} ──", app.session.id)));
     }
@@ -185,6 +187,9 @@ pub async fn run(
         anyhow::bail!("tursi is a TUI — run it in a terminal");
     }
     let mut terminal = ratatui::init();
+    // The agent field twinkles and the working line's clock moves without
+    // events: redraw on a short tick.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
     let result = loop {
         if let Err(e) = terminal.draw(|frame| render::draw(frame, &mut app)) {
             break Err(e.into());
@@ -209,6 +214,7 @@ pub async fn run(
                 }
                 None => break Ok(()),
             },
+            _ = tick.tick() => {}
         }
         if app.quitting {
             break Ok(());
@@ -233,7 +239,7 @@ impl App {
         self.status = Some(format!("✗ {}", s.into()));
     }
 
-    /// Insert-mode Enter: steering if a task runs, otherwise a new task (§5.2).
+    /// Enter: steering if a task runs, otherwise a new task (§5.2).
     pub async fn send_message(&mut self) -> Result<()> {
         let text = std::mem::take(&mut self.input);
         self.cursor = 0;
@@ -247,12 +253,14 @@ impl App {
             self.set_status("queued as steering for the next iteration");
         } else if self.cmd.send(agent::Command::Task(text)).await.is_err() {
             // The agent task is gone (panic?) — never leave a silent hang.
-            self.set_error("agent task is gone — restart tursi (.tursi/harness.log has details)");
+            self.set_error("agent task is gone — restart tursi (`/log ERROR` shows details)");
         } else {
             self.task_running = true;
             self.task_started = Some(std::time::Instant::now());
             self.task_start_usd = self.session_usd;
+            self.lead_steps = 0;
             self.scroll = 0;
+            self.status = None;
             let _ = self.session.transition(crate::session::State::Running);
         }
         Ok(())
@@ -265,47 +273,21 @@ impl App {
         self.set_status("interrupting — waiting for the loop to unwind…");
     }
 
-    /// Apply one agent event to the view. A subagent's events (§5.7) fold
-    /// into the parent's `agent` entry as a trace; nothing else of theirs is
-    /// shown unless the user expands it.
+    /// Apply one agent event to the view. A subagent's events go to its
+    /// tile; the lead's tool traffic is counted, never shown.
     pub fn apply_event(&mut self, event: UiEvent) {
         if event.agent != ROOT {
-            let line = match event.kind {
-                EventKind::ToolStarted { name, summary } => format!("{name} {summary}"),
-                EventKind::ToolFinished { name, content, is_error } if is_error => {
-                    format!("✗ {name}: {}", content.lines().next().unwrap_or(""))
-                }
-                EventKind::TaskDone { summary } => format!("done: {}", summary.lines().next().unwrap_or("")),
-                _ => return,
-            };
-            if let Some(Entry::Tool { trace, .. }) = self
-                .transcript
-                .iter_mut()
-                .rev()
-                .find(|e| matches!(e, Entry::Tool { name, result: None, .. } if name == "agent"))
-            {
-                trace.push(line);
-            }
+            agents::apply(&mut self.tiles, event.agent.0, event.kind);
             return;
         }
         match event.kind {
             EventKind::AgentText(delta) => self.partial.push_str(&delta),
-            EventKind::ToolStarted { name, summary } => {
+            EventKind::ToolStarted { .. } => {
                 self.flush_partial();
-                self.transcript.push(Entry::Tool { name, summary, result: None, trace: Vec::new() });
+                self.lead_steps += 1;
             }
-            EventKind::ToolFinished { name, content, is_error } => {
-                // Results land on the newest unanswered call with that name.
-                let slot = self.transcript.iter_mut().rev().find_map(|e| match e {
-                    Entry::Tool { name: n, result, .. } if *n == name && result.is_none() => Some(result),
-                    _ => None,
-                });
-                match slot {
-                    Some(result) => *result = Some(ToolResult { content, is_error }),
-                    None => self.transcript.push(Entry::Tool { name, summary: String::new(), result: Some(ToolResult { content, is_error }), trace: Vec::new() }),
-                }
-            }
-            EventKind::FileDiff(diff) => self.transcript.push(Entry::Diff(diff)),
+            EventKind::ToolFinished { .. } => {}
+            EventKind::SubagentStarted { .. } | EventKind::SubagentFinished { .. } => {}
             EventKind::Approval(request) => {
                 bell();
                 let _ = self.session.transition(crate::session::State::AwaitingApproval);
@@ -316,6 +298,7 @@ impl App {
                 let _ = self.session.transition(crate::session::State::AwaitingUser);
                 self.overlay = Some(Overlay::Ask(request, String::new()));
             }
+            EventKind::Balance { usd } => self.balance_usd = Some(usd),
             EventKind::Cost { session_usd, month_usd } => {
                 self.session_usd = session_usd;
                 self.month_usd = month_usd;
@@ -341,6 +324,7 @@ impl App {
                     elapsed: self.task_started.take().map(|t| t.elapsed()).unwrap_or_default(),
                     at: chrono::Local::now().format("%-I:%M %p").to_string(),
                     cost_usd: (self.session_usd - self.task_start_usd).max(0.0),
+                    balance_usd: self.balance_usd,
                     ctx_tokens: self.ctx_used,
                 });
                 self.task_running = false;
@@ -353,6 +337,9 @@ impl App {
             EventKind::MonitorWoke { text } => {
                 self.flush_partial();
                 self.transcript.push(Entry::Wake(text));
+                if !self.task_running {
+                    self.lead_steps = 0;
+                }
                 self.task_running = true;
                 self.task_started = Some(std::time::Instant::now());
                 self.task_start_usd = self.session_usd;
@@ -360,6 +347,16 @@ impl App {
                 let _ = self.session.transition(crate::session::State::Running);
             }
             EventKind::Monitors { armed } => self.monitors = armed,
+            EventKind::Goal { condition, turns, last_reason } => {
+                self.goal = condition.map(|c| {
+                    let since = self.goal.as_ref().filter(|(old, ..)| *old == c).map(|(_, s, ..)| *s).unwrap_or_else(std::time::Instant::now);
+                    (c, since, turns, last_reason)
+                });
+            }
+            EventKind::GoalVerdict { verdict, reason } => {
+                self.flush_partial();
+                self.transcript.push(Entry::Note(format!("◎ goal {verdict} — {reason}")));
+            }
         }
     }
 
@@ -409,28 +406,31 @@ pub(crate) mod testui {
             },
         };
         let app = App {
-            mode: Mode::Normal,
             input: String::new(),
             cursor: 0,
-            command: String::new(),
+            history: Vec::new(),
+            history_pos: None,
             status: None,
             scroll: 0,
-            pending: None,
             overlay: None,
             quitting: false,
             afk: false,
             plan_active: false,
             stubs: None,
             monitors: Vec::new(),
+            goal: None,
             session_usd: 0.0,
             month_usd: 0.0,
+            balance_usd: None,
             ctx_used: 0,
             ctx_window: crate::agent::prompt::DEFAULT_CONTEXT_WINDOW,
             model: "test/model".into(),
             task_running: false,
             transcript: Vec::new(),
             partial: String::new(),
-            verbose: false,
+            lead_steps: 0,
+            tiles: Vec::new(),
+            clock: std::time::Instant::now(),
             task_started: None,
             task_start_usd: 0.0,
             view_height: 24,
@@ -451,23 +451,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn streamed_text_becomes_a_block_and_results_attach_to_their_call() {
+    fn the_chat_shows_prose_and_subagents_get_tiles() {
         let (mut app, ..) = testui::app("ui-stream");
         app.apply_event(UiEvent { agent: ROOT, kind: EventKind::AgentText("hel".into()) });
         app.apply_event(UiEvent { agent: ROOT, kind: EventKind::AgentText("lo\nworld".into()) });
         assert_eq!(app.partial, "hello\nworld");
         app.apply_event(UiEvent { agent: ROOT, kind: EventKind::ToolStarted { name: "read".into(), summary: "a.rs".into() } });
-        assert!(matches!(&app.transcript[0], Entry::Agent(t) if t == "hello\nworld"), "partial flushed as a block");
         app.apply_event(UiEvent { agent: ROOT, kind: EventKind::ToolFinished { name: "read".into(), content: "1→x".into(), is_error: false } });
-        assert!(matches!(&app.transcript[1], Entry::Tool { result: Some(r), .. } if r.content == "1→x"));
+        assert!(matches!(&app.transcript[0], Entry::Agent(t) if t == "hello\nworld"), "partial flushed as a block");
+        assert_eq!(app.transcript.len(), 1, "the lead's tool calls are not shown");
+        assert_eq!(app.lead_steps, 1, "only counted");
+        // Two children: each becomes a dot in the field.
+        for (n, access) in [(1u32, "writer"), (2, "reader")] {
+            app.apply_event(UiEvent { agent: crate::bus::AgentId(n), kind: EventKind::SubagentStarted { access: access.into(), title: format!("task {n}"), model: "m".into(), continued: false } });
+        }
+        app.apply_event(UiEvent { agent: crate::bus::AgentId(2), kind: EventKind::ToolStarted { name: "read".into(), summary: "b.rs".into() } });
+        app.apply_event(UiEvent { agent: crate::bus::AgentId(1), kind: EventKind::ToolStarted { name: "edit".into(), summary: "a.rs".into() } });
+        let field: Vec<(u32, String, bool)> = app.tiles.iter().map(|t| (t.id, t.access.clone(), t.running())).collect();
+        assert_eq!(field, vec![(1, "writer".to_string(), true), (2, "reader".to_string(), true)]);
+        assert_eq!(app.transcript.len(), 1, "subagent traffic stays out of the chat");
         app.task_running = true;
         app.task_started = Some(std::time::Instant::now());
         app.apply_event(UiEvent { agent: ROOT, kind: EventKind::AgentText("all done".into()) });
         app.apply_event(UiEvent { agent: ROOT, kind: EventKind::TaskDone { summary: "all done".into() } });
         // The streamed prose is the summary: shown once, then the footer.
-        assert!(matches!(&app.transcript[2], Entry::Agent(t) if t == "all done"));
+        assert!(matches!(&app.transcript[1], Entry::Agent(t) if t == "all done"));
         assert!(matches!(app.transcript.last(), Some(Entry::Done { ok: true, .. })));
-        assert_eq!(app.transcript.len(), 4);
+        assert_eq!(app.transcript.len(), 3);
         assert!(!app.task_running);
     }
 

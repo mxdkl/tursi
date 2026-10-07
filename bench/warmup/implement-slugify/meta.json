@@ -1,0 +1,9 @@
+{
+ "activity": "new",
+ "domain": "backend",
+ "difficulty": 1.14,
+ "protect": [
+  "test_textutil.py"
+ ],
+ "prompt": "Implement slugify() in textutil.py so that `python3 -m unittest -q` passes. Do not change the tests. Run the tests before you finish."
+}

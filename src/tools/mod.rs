@@ -1,6 +1,7 @@
 //! Tool roster (§4): schemas, the approval-gated executor, and dispatch.
 
 pub mod agent;
+pub mod decide;
 pub mod ask;
 pub mod custom;
 pub mod debugger;
@@ -8,6 +9,7 @@ pub mod exec;
 pub mod fs;
 pub mod intel;
 pub mod monitor;
+pub mod normalize;
 pub mod profile;
 pub mod rizin;
 pub mod search;
@@ -28,24 +30,45 @@ pub struct Toolbox {
     pub lsp: crate::lsp::Manager,
     pub debugger: Option<crate::dap::Session>,
     pub rizin: Option<crate::rizin::Session>,
-    /// Shared with subagents: their edits checkpoint into the same store, so
-    /// `:rewind` covers them and sequence numbers never collide.
-    pub checkpoints: std::sync::Arc<std::sync::Mutex<crate::checkpoint::Store>>,
+    /// Shared with subagents: every agent's file changes, tool-made or
+    /// shell-made, go through one recorder (§3.3).
+    pub changes: std::sync::Arc<std::sync::Mutex<crate::changes::Changes>>,
     pub custom: custom::Registry,
-    /// Tools this agent may call (None = all). Subagents get a role's subset.
+    /// Tools this agent may call (None = all). Subagents get a reader's or
+    /// a writer's set (§5.7).
     pub mask: Option<&'static [&'static str]>,
+    /// Areas this agent may write: None for the root agent, empty for a
+    /// reader; a fork's subtasks must stay inside them.
+    pub writes: Option<Vec<String>>,
+    /// Tools withheld from an otherwise unmasked agent — the lead's
+    /// `edit`/`write` when it works through subagents (§5.7).
+    pub denied: &'static [&'static str],
     /// Spawns subagents (§5.7). None in a subagent: no nesting.
     pub subagents: Option<std::sync::Arc<crate::agent::Spawner>>,
     /// Session-scoped watches (`monitor` tool); the loop drains their events.
     pub monitors: crate::monitor::Manager,
+    /// Decision model for `decide` and the shadow gate (None = not configured).
+    pub decider: Option<std::sync::Arc<crate::decide::Decider>>,
     pub afk: bool,
     /// Run a post-edit LSP diagnostics pass, spawning the server on first touch
     /// (§3.1). Mirrors `Config::lsp_check_edits`; off in tests so an edit never
     /// spawns rust-analyzer/tsserver.
     pub lsp_check_edits: bool,
-    /// Current task + turn, for checkpoint tagging and read dedupe.
+    /// Current task + turn, for change attribution and read dedupe.
     pub task: u32,
     pub turn: u32,
+    /// Set by `split` (§5.8): the loop ends the task and hands back what was
+    /// finished and what remains.
+    pub split: Option<(String, String)>,
+    /// Set by `fork` (§5.8): the loop ends the task; the pool runs these in
+    /// parallel and continues with their reports.
+    pub fork: Option<ForkSpec>,
+}
+
+pub struct ForkSpec {
+    pub done: String,
+    pub tasks: Vec<crate::deals::pool::ChildSpec>,
+    pub then: String,
 }
 
 pub struct Executor {
@@ -60,8 +83,11 @@ impl Executor {
     /// TODO(§5.2 parallel): fan out read-only calls once Toolbox splits the
     /// read-tracker (which `read` mutates) from truly shared state; execution
     /// is serial today, in call order.
-    pub async fn run_batch(&mut self, calls: Vec<ToolCall>, ui: &UiHandle) -> Result<Vec<Message>> {
+    pub async fn run_batch(&mut self, mut calls: Vec<ToolCall>, ui: &UiHandle) -> Result<Vec<Message>> {
         self.toolbox.turn += 1;
+        for call in &mut calls {
+            normalize::canonicalize(call);
+        }
         let mut results = Vec::with_capacity(calls.len());
         for call in &calls {
             ui.send(crate::bus::EventKind::ToolStarted {
@@ -101,6 +127,14 @@ impl Executor {
         if self.toolbox.mask.is_some_and(|m| !m.contains(&call.name.as_str())) {
             anyhow::bail!("{} is not available to this agent", call.name);
         }
+        if self.toolbox.denied.contains(&call.name.as_str()) {
+            anyhow::bail!(
+                "{} is not yours: you lead, subagents edit. Delegate this change with `agent`, the files it \
+                 changes in `writes`, and a brief that names the exact change and what to run; or follow up with \
+                 the subagent that already has the context (agent: \"agent-N\")",
+                call.name
+            );
+        }
         match call.name.as_str() {
             "read" => fs::read(&mut self.toolbox, &call.arguments).await,
             "write" => fs::write(&mut self.toolbox, &call.arguments, ui).await,
@@ -115,6 +149,13 @@ impl Executor {
             "ask_user" => ask::run(&self.toolbox, &call.arguments, ui).await,
             "monitor" => monitor::run(&mut self.toolbox, &call.arguments, ui).await,
             "agent" => agent::run(&mut self.toolbox, &call.arguments, ui).await,
+            "tasks" => match &self.toolbox.subagents {
+                Some(spawner) => Ok(spawner.look().await),
+                None => anyhow::bail!("only the root agent files tasks"),
+            },
+            "decide" => decide::run(&mut self.toolbox, &call.arguments).await,
+            "split" => split(&mut self.toolbox, &call.arguments),
+            "fork" => fork(&mut self.toolbox, &call.arguments).await,
             other => custom::run(&mut self.toolbox, other, &call.arguments).await,
         }
     }
@@ -148,10 +189,10 @@ pub fn exercises_change(call: &ToolCall) -> bool {
             .get("steps")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|steps| {
-                steps.iter().filter_map(|s| s.get("command")?.as_str()).any(|command| {
-                    crate::shell::pipe_segments(command)
-                        .is_ok_and(|segments| segments.iter().any(|seg| !is_inspection(seg)))
-                })
+                steps
+                    .iter()
+                    .filter_map(|s| s.get("command")?.as_str())
+                    .any(|command| crate::shell::segments(command).iter().any(|seg| !is_inspection(seg)))
             }),
         _ => false,
     }
@@ -166,11 +207,160 @@ fn is_inspection(segment: &str) -> bool {
     INSPECTION_PROGRAMS.contains(&program)
 }
 
-/// One-line gist of a call for the ToolStarted transcript line.
-fn summarize(call: &ToolCall) -> String {
+/// `split` (§5.8): a subagent hands back the rest of its brief. The loop
+/// ends the task after this batch; the pool queues a continuation.
+fn split(tb: &mut Toolbox, args: &serde_json::Value) -> Result<String> {
+    let field = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::trim).unwrap_or("").to_string();
+    let (done, remaining) = (field("done"), field("remaining"));
+    if done.is_empty() || remaining.is_empty() {
+        anyhow::bail!("give both `done` (what you finished, with file:line) and `remaining` (what is left, as a brief)");
+    }
+    tb.split = Some((done, remaining));
+    Ok("Handed back — stop here; your turn ends with this call.".into())
+}
+
+/// Write areas as declared to `agent` or `fork`, made project-relative and
+/// tidy (`./src/net/` → `src/net`). `.` is the whole project, allowed only
+/// where `whole`; anything outside the project is refused.
+pub(crate) fn areas(project: &std::path::Path, list: &[String], whole: bool) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for w in list {
+        let w = w.trim();
+        let rel = std::path::Path::new(w).strip_prefix(project).map(|p| p.display().to_string()).unwrap_or_else(|_| w.to_string());
+        let rel = rel.trim_start_matches("./").trim_end_matches('/');
+        let rel = if rel.is_empty() || rel == "." { "." } else { rel };
+        if rel.starts_with('/') || rel.split('/').any(|c| c == "..") {
+            anyhow::bail!("`{w}` is not inside the project");
+        }
+        if rel == "." && !whole {
+            anyhow::bail!("`{w}` is the whole project, which leaves nothing to run alongside it — name the files or directories");
+        }
+        if !out.iter().any(|o| o == rel) {
+            out.push(rel.to_string());
+        }
+    }
+    // The whole project subsumes everything else.
+    if out.iter().any(|o| o == ".") {
+        out = vec![".".to_string()];
+    }
+    Ok(out)
+}
+
+/// `a` contains `b`, or `b` contains `a`.
+fn overlaps(a: &str, b: &str) -> bool {
+    a == "." || b == "." || a == b || b.starts_with(&format!("{a}/")) || a.starts_with(&format!("{b}/"))
+}
+
+/// `fork` (§5.8, an extension of DEALS): independent parts of the brief run
+/// in parallel, then a continuation picks up with their reports. Refused
+/// unless the parts look independent: no two write the same area, each
+/// writes only inside the forking agent's own areas, and the decision model
+/// (when configured) agrees that none needs another's result. Each subtask
+/// is labelled like any task (`deals::labels`).
+async fn fork(tb: &mut Toolbox, args: &serde_json::Value) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Part {
+        brief: String,
+        #[serde(default)]
+        writes: Vec<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Args {
+        #[serde(default)]
+        done: String,
+        tasks: Vec<Part>,
+        then: String,
+    }
+    let args: Args = serde_json::from_value(args.clone())?;
+    if args.tasks.len() < 2 {
+        anyhow::bail!("a fork needs at least two tasks — for one, use split or do it yourself");
+    }
+    if args.tasks.len() > 8 {
+        anyhow::bail!("at most 8 tasks per fork — group related pieces into fewer tasks");
+    }
+    if args.then.trim().is_empty() {
+        anyhow::bail!("say in `then` what the continuation does with the results (integrate, run the full suite, …)");
+    }
+    let mine = tb.writes.clone().unwrap_or_else(|| vec![".".to_string()]);
+    let mut tasks = Vec::new();
+    for (n, part) in args.tasks.into_iter().enumerate() {
+        if part.brief.trim().chars().count() < 30 {
+            anyhow::bail!("task {}: the brief is too short to stand alone — say what to do, where, and what to report", n + 1);
+        }
+        let writes = areas(&tb.project, &part.writes, false).map_err(|e| anyhow::anyhow!("task {}: {e}", n + 1))?;
+        for w in &writes {
+            let inside = mine.iter().any(|m| m == "." || m == w || w.starts_with(&format!("{m}/")));
+            if !inside {
+                anyhow::bail!(
+                    "task {} writes `{w}`, outside what you may change ({}) — a subtask can only change what you can",
+                    n + 1,
+                    if mine.is_empty() { "nothing: you are read-only".to_string() } else { mine.join(", ") }
+                );
+            }
+        }
+        tasks.push(crate::deals::pool::ChildSpec { brief: part.brief, writes, labels: Default::default() });
+    }
+    for i in 0..tasks.len() {
+        for j in i + 1..tasks.len() {
+            for a in &tasks[i].writes {
+                if let Some(b) = tasks[j].writes.iter().find(|b| overlaps(a, b)) {
+                    anyhow::bail!(
+                        "tasks {} and {} both write `{}` — give that area to one task, do it before forking, or split in order",
+                        i + 1,
+                        j + 1,
+                        if a.len() <= b.len() { a } else { b }
+                    );
+                }
+            }
+        }
+    }
+    if let Some(decider) = tb.decider.clone() {
+        let state = serde_json::json!({
+            "then": args.then,
+            "tasks": tasks.iter().enumerate().map(|(n, t)| serde_json::json!({
+                "n": n + 1, "brief": t.brief.chars().take(600).collect::<String>(), "writes": t.writes,
+            })).collect::<Vec<_>>(),
+        });
+        let question = crate::decide::Question::noul(
+            "These subtasks are about to run at the same time, each by a separate agent that cannot see the others' \
+             work until all have finished. Can every one of them be completed without first needing another one's \
+             result or changes?",
+        );
+        // Every subtask is labelled while independence is judged.
+        let labelling: Vec<_> = tasks
+            .iter()
+            .map(|t| {
+                let (decider, brief) = (decider.clone(), t.brief.clone());
+                tokio::spawn(async move { crate::deals::labels::label(Some(&decider), &brief).await })
+            })
+            .collect();
+        let independent = decider.ask(state, vec![("independent".to_string(), question)]).await;
+        for (t, labels) in tasks.iter_mut().zip(labelling) {
+            t.labels = labels.await.unwrap_or_default();
+        }
+        if let Ok(d) = independent {
+            decider.record("fork", &format!("{} tasks", tasks.len()), &d);
+            let p = d.answers.get("independent").and_then(|a| a.noul).unwrap_or(1.0);
+            if p < 0.35 {
+                anyhow::bail!(
+                    "the decision model judged these tasks dependent on each other ({p:.2}) — do dependent work in order \
+                     (split, or do it first), and fork only the parts that need nothing from each other"
+                );
+            }
+        }
+    }
+    let n = tasks.len();
+    tb.fork = Some(ForkSpec { done: args.done, tasks, then: args.then });
+    Ok(format!("Forked {n} tasks — stop here; a continuation picks up with their reports."))
+}
+
+/// One-line gist of a call for the ToolStarted transcript line (and a
+/// trajectory step in DEALS memory).
+pub(crate) fn summarize(call: &ToolCall) -> String {
     let a = &call.arguments;
     if call.name == "agent" {
-        let role = a.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+        let writes = a.get("writes").and_then(|v| v.as_array()).is_some_and(|w| !w.is_empty());
+        let role = a.get("agent").and_then(|v| v.as_str()).unwrap_or(if writes { "writer" } else { "reader" });
         let brief: String = a.get("brief").and_then(|v| v.as_str()).unwrap_or("").lines().next().unwrap_or("").chars().take(70).collect();
         return format!("{role}: {brief}");
     }
@@ -199,11 +389,12 @@ fn summarize(call: &ToolCall) -> String {
 /// cacheable prefix (§8.4), filtered to `mask` for subagents. Descriptions
 /// stay terse — they're token-billed on every request; the system prompt
 /// carries the behavioral rules.
-pub fn schemas(custom: &custom::Registry, mask: Option<&[&str]>) -> Vec<ToolSchema> {
+pub fn schemas(custom: &custom::Registry, mask: Option<&[&str]>, denied: &[&str]) -> Vec<ToolSchema> {
     let mut all = all_schemas(custom);
     if let Some(mask) = mask {
         all.retain(|s| mask.contains(&s.name.as_str()));
     }
+    all.retain(|s| !denied.contains(&s.name.as_str()));
     all
 }
 
@@ -258,14 +449,15 @@ fn all_schemas(custom: &custom::Registry) -> Vec<ToolSchema> {
         },
         ToolSchema {
             name: "execute_command".into(),
-            description: "Run commands as ordered steps (one program each; pipes/redirects ok, \
-                          no && ; || &). Starts at the project root."
+            description: "Run shell commands as ordered steps. Each step is a shell script (chains, \
+                          pipes, redirects, $(…), heredocs ok; no trailing &, use background). One \
+                          shell per call, starting at the project root."
                 .into(),
             parameters: json!({"type":"object","properties":{
                 "steps":{"type":"array","items":{"type":"object","properties":{
                     "command":{"type":"string"},
-                    "cwd":{"type":"string","description":"directory for this step (replaces cd)"},
-                    "env":{"type":"object","additionalProperties":{"type":"string"},"description":"env for this step (replaces export)"},
+                    "cwd":{"type":"string","description":"directory for this step only"},
+                    "env":{"type":"object","additionalProperties":{"type":"string"},"description":"env for this step only"},
                     "streams":{"enum":["auto","none","stdout","stderr","both"],"default":"auto",
                         "description":"auto: stdout on success, error extract on failure"},
                     "timeout_seconds":{"type":"integer","default":30},
@@ -357,18 +549,75 @@ fn all_schemas(custom: &custom::Registry) -> Vec<ToolSchema> {
         },
         ToolSchema {
             name: "agent".into(),
-            description: "Delegate to a subagent with a fresh context; you get back only its \
-                          report. Roles: explore (read-only research across many files: where \
-                          is X, how does Y work), review (read-only critique of a change against \
-                          a spec), worker (full tools: implement a well-specified, self-contained \
-                          piece). The brief must stand alone — the child knows nothing of this \
-                          conversation. Use for research spanning 10+ files or independent \
-                          pieces of work; not for small tasks or work that chains."
+            description: "Delegate to a subagent; you get back only its report. If the task changes files, list \
+                          them (or their directories) in `writes`, `.` for anywhere; without `writes` the subagent \
+                          can read, search, build and run but not change the project. The harness works out what \
+                          kind of task it is, picks the model, and queues tasks when every slot is busy. Returns at \
+                          once; the report arrives as a message when the child finishes, so launch every \
+                          independent piece together and keep working; end your turn when you need the reports. A \
+                          new child knows nothing of this conversation — the brief must stand alone. To follow up \
+                          with an earlier child, its context intact, pass agent:\"agent-N\" (and `writes` to change \
+                          what it may write)."
                 .into(),
             parameters: json!({"type":"object","properties":{
-                "role":{"enum":["explore","review","worker"]},
+                "writes":{"type":"array","items":{"type":"string"},"description":"files or directories it may change; omit for read-only"},
+                "agent":{"type":"string","description":"agent-N to continue an earlier subagent"},
+                "needs":{"type":"array","items":{"enum":["vision","reasoning","long_context"]},"description":"only when the task truly requires it"},
                 "brief":{"type":"string"}},
-                "required":["role","brief"]}),
+                "required":["brief"]}),
+        },
+        ToolSchema {
+            name: "tasks".into(),
+            description: "See the task pipeline: every task you filed, where it is queued or running and on which \
+                          model, what it may write, and how finished ones went. Reports arrive by themselves: \
+                          to wait for them, end your turn. Asked again with nothing changed, it waits up to a minute \
+                          for a change."
+                .into(),
+            parameters: json!({"type":"object","properties":{}}),
+        },
+        ToolSchema {
+            name: "split".into(),
+            description: "Hand back the rest of your brief: say what you finished and what remains. You stop; a \
+                          fresh subagent continues from your results. Use it when the remaining part is a separate \
+                          job or your context is getting long — not to skip hard parts."
+                .into(),
+            parameters: json!({"type":"object","properties":{
+                "done":{"type":"string","description":"what you finished, with files and results"},
+                "remaining":{"type":"string","description":"what is left, written as a brief"}},
+                "required":["done","remaining"]}),
+        },
+        ToolSchema {
+            name: "fork".into(),
+            description: "Run independent parts of your brief in parallel, then continue: each task goes to its own \
+                          subagent at the same time; when all have finished, a fresh subagent picks up with their \
+                          reports and `then`. Only for parts that need nothing from each other. Each brief must stand \
+                          alone. A task that changes files lists the files or directories it writes in `writes`, \
+                          inside what you may write; no two tasks may write the same area. You stop when you call it."
+                .into(),
+            parameters: json!({"type":"object","properties":{
+                "done":{"type":"string","description":"what you finished first, if anything"},
+                "tasks":{"type":"array","items":{"type":"object","properties":{
+                    "brief":{"type":"string"},
+                    "writes":{"type":"array","items":{"type":"string"},"description":"files or directories this task writes; omit for read-only"}},
+                    "required":["brief"]}},
+                "then":{"type":"string","description":"what the continuation does with the results"}},
+                "required":["tasks","then"]}),
+        },
+        ToolSchema {
+            name: "decide".into(),
+            description: "Calibrated probabilities from a fast decision model for questions with a \
+                          fixed answer set: pick among options, yes/no, or rate on a scale. Put the \
+                          facts in context — it sees nothing else. Cheap (<1 s). Advice, not authority."
+                .into(),
+            parameters: json!({"type":"object","properties":{
+                "context":{"description":"the facts, as text or an object"},
+                "questions":{"type":"array","items":{"type":"object","properties":{
+                    "id":{"type":"string"},
+                    "question":{"type":"string"},
+                    "options":{"description":"list of names, or {name: description} — makes it a choice"},
+                    "scale":{"type":"array","items":{"type":"string"},"description":"ordered levels — makes it a rating"}},
+                    "required":["question"]}}},
+                "required":["context","questions"]}),
         },
         ToolSchema {
             name: "monitor".into(),
@@ -396,6 +645,51 @@ fn all_schemas(custom: &custom::Registry) -> Vec<ToolSchema> {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn fork_refuses_overlap_and_writes_beyond_its_own_and_accepts_a_clean_split() {
+        let dir = testutil::tmp("fork-tool");
+        let (mut tb, _ui, _rx) = testutil::toolbox(&dir);
+        let brief = "a brief long enough to stand on its own two feet";
+        let overlap = serde_json::json!({"then": "integrate", "tasks": [
+            {"brief": brief, "writes": ["src/net"]},
+            {"brief": brief, "writes": ["src/net/http.rs"]}]});
+        let err = fork(&mut tb, &overlap).await.unwrap_err().to_string();
+        assert!(err.contains("tasks 1 and 2 both write `src/net`"), "{err}");
+        let whole = serde_json::json!({"then": "x", "tasks": [{"brief": brief, "writes": ["."]}, {"brief": brief}]});
+        assert!(fork(&mut tb, &whole).await.unwrap_err().to_string().contains("whole project"));
+        assert!(fork(&mut tb, &serde_json::json!({"then": "x", "tasks": [{"brief": brief}]})).await.is_err());
+        let ok = serde_json::json!({"done": "planned", "then": "run the suite", "tasks": [
+            {"brief": brief, "writes": ["./src/net/"]},
+            {"brief": brief, "writes": ["src/netlify.rs"]},
+            {"brief": brief}]});
+        assert!(fork(&mut tb, &ok).await.unwrap().starts_with("Forked 3 tasks"));
+        let f = tb.fork.take().unwrap();
+        assert_eq!(f.tasks[0].writes, vec!["src/net"], "normalized");
+        assert!(f.tasks[2].writes.is_empty(), "no writes: a reader");
+        assert_eq!(f.then, "run the suite");
+        // A subtask can change only what its parent can.
+        tb.writes = Some(vec!["src".into()]);
+        let outside = serde_json::json!({"then": "x", "tasks": [{"brief": brief, "writes": ["src/a.rs"]}, {"brief": brief, "writes": ["docs"]}]});
+        assert!(fork(&mut tb, &outside).await.unwrap_err().to_string().contains("task 2 writes `docs`, outside"));
+        tb.writes = Some(vec![]);
+        let reader = serde_json::json!({"then": "x", "tasks": [{"brief": brief, "writes": ["src/a.rs"]}, {"brief": brief}]});
+        assert!(fork(&mut tb, &reader).await.unwrap_err().to_string().contains("you are read-only"));
+        let readers = serde_json::json!({"then": "x", "tasks": [{"brief": brief}, {"brief": brief}]});
+        assert!(fork(&mut tb, &readers).await.is_ok(), "a reader may fork readers");
+    }
+
+    #[test]
+    fn areas_are_project_relative_and_whole_project_subsumes() {
+        let p = std::path::Path::new("/w/proj");
+        let a = |l: &[&str], whole| areas(p, &l.iter().map(|s| s.to_string()).collect::<Vec<_>>(), whole);
+        assert_eq!(a(&["./src/", "/w/proj/docs/a.md", "src"], false).unwrap(), vec!["src", "docs/a.md"]);
+        assert_eq!(a(&["src", "."], true).unwrap(), vec!["."]);
+        assert_eq!(a(&["/w/proj"], true).unwrap(), vec!["."]);
+        assert!(a(&["."], false).is_err());
+        assert!(a(&["../elsewhere"], true).is_err());
+        assert!(a(&["/etc"], true).is_err());
+    }
     use super::*;
 
     fn exec(commands: &[&str]) -> ToolCall {
@@ -415,10 +709,14 @@ mod tests {
         assert!(exercises_change(&exec(&["ls", "cat input.txt | python3 main.py"])));
         assert!(exercises_change(&exec(&["./target/debug/app --help"])));
         assert!(exercises_change(&exec(&["git stash"])));
+        // Chains count by their parts: looking around then testing is a run.
+        assert!(!exercises_change(&exec(&["cd src && ls; git status || true"])));
+        assert!(exercises_change(&exec(&["ls && cargo test"])));
+        assert!(!exercises_change(&exec(&["cat <<'EOF'\ncargo test\nEOF"])), "a heredoc body is data, not a command");
     }
 
     #[tokio::test]
-    async fn a_masked_toolbox_refuses_tools_outside_its_role() {
+    async fn a_masked_toolbox_refuses_tools_outside_its_set() {
         let dir = testutil::tmp("mask");
         let (mut toolbox, ui, _rx) = testutil::toolbox(&dir);
         toolbox.mask = Some(&["read", "search"]);
@@ -433,10 +731,15 @@ mod tests {
         assert!(matches!(&results[0], Message::ToolResult { is_error: true, content, .. } if content.contains("not available to this agent")));
         assert!(!dir.join("x.txt").exists());
         // Schemas shrink to the mask; the agent tool itself is never in a child's set.
-        let names: Vec<String> = schemas(&custom::Registry { entries: vec![] }, Some(&["read", "search"])).into_iter().map(|s| s.name).collect();
+        let names: Vec<String> = schemas(&custom::Registry { entries: vec![] }, Some(&["read", "search"]), &[]).into_iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["read".to_string(), "search".to_string()]);
-        assert!(schemas(&custom::Registry { entries: vec![] }, None).iter().any(|s| s.name == "agent"));
-        assert!(crate::agent::Role::parse("worker").is_ok() && crate::agent::Role::parse("boss").is_err());
+        assert!(schemas(&custom::Registry { entries: vec![] }, None, &[]).iter().any(|s| s.name == "agent"));
+        // A mask keeps only what it names, in roster order.
+        let lead: Vec<String> = schemas(&custom::Registry { entries: vec![] }, Some(&["agent", "tasks", "ask_user"]), &[])
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(lead, vec!["ask_user", "agent", "tasks"]);
     }
 
     #[tokio::test]
@@ -476,16 +779,21 @@ pub(crate) mod testutil {
             lsp: crate::lsp::Manager::new(dir.to_path_buf(), Default::default(), sandbox.clone()),
             debugger: None,
         rizin: None,
-            checkpoints: std::sync::Arc::new(std::sync::Mutex::new(crate::checkpoint::Store::open(dir, uuid::Uuid::now_v7()).unwrap())),
+            changes: std::sync::Arc::new(std::sync::Mutex::new(crate::changes::Changes::open(dir))),
             custom: custom::Registry { entries: vec![] },
             mask: None,
+            writes: None,
+            denied: &[],
             subagents: None,
             monitors: crate::monitor::Manager::new(sandbox.clone()).0,
+            decider: None,
             sandbox,
             afk: false,
             lsp_check_edits: false,
             task: 1,
             turn: 1,
+            split: None,
+            fork: None,
         };
         (tb, UiHandle { agent: ROOT, tx }, rx)
     }

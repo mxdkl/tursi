@@ -1,5 +1,5 @@
 //! Model selection: one configured model, API-failure fallbacks, and the
-//! `:model` pin. No escalation — the model never changes on task signals.
+//! `/model` pin. No escalation — the model never changes on task signals.
 
 pub struct Router {
     /// The configured model first, then its fallbacks in order.
@@ -16,7 +16,7 @@ impl Router {
         Router { models, model: 0, pinned: None }
     }
 
-    /// Active model id (`:model` pin overrides the configuration).
+    /// Active model id (`/model` pin overrides the configuration).
     pub fn model(&self) -> &str {
         match &self.pinned {
             Some(pinned) => pinned,

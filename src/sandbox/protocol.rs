@@ -32,6 +32,15 @@ pub struct Spec {
     pub proxy: Option<ProxySpec>,
 }
 
+/// A per-spawn read-only project: everything under `project` is read-only to
+/// the process except the `writable` directories (build output), which must
+/// exist and lie inside it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadOnly {
+    pub project: PathBuf,
+    pub writable: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxySpec {
     pub socket: PathBuf,
@@ -62,7 +71,15 @@ pub enum What {
 pub enum Request {
     Setup(Spec),
     /// Exactly three descriptors ride along: stdin, stdout, stderr.
-    Spawn { id: u64, argv: Vec<String>, env: Vec<(String, String)>, cwd: PathBuf },
+    Spawn {
+        id: u64,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: PathBuf,
+        /// Run this one with the project read-only (the lead, §5.7).
+        #[serde(default)]
+        read_only: Option<ReadOnly>,
+    },
     /// SIGKILL the spawn's whole process group.
     Kill { id: u64 },
 }

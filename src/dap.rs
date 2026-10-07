@@ -28,7 +28,7 @@ pub struct Session {
     stopped_thread: Option<i64>,
     last_stop: Option<(String, Option<String>)>,
     exited: Option<i32>,
-    /// Accumulated output events; the debugger tool flushes to debug.log.
+    /// Accumulated output events; the debugger tool flushes to the ledger.
     output: String,
     /// DAP set*Breakpoints calls REPLACE the set — full lists are tracked.
     src_bps: HashMap<PathBuf, Vec<(u32, Option<String>)>>,
@@ -419,7 +419,7 @@ impl Session {
         Ok(body.get("result").and_then(Value::as_str).unwrap_or("").trim_end().to_string())
     }
 
-    /// Everything the target printed since the last flush (→ debug.log).
+    /// Everything the target printed since the last flush (→ the ledger).
     pub fn take_output(&mut self) -> String {
         std::mem::take(&mut self.output)
     }

@@ -56,7 +56,7 @@ pub fn plan_injection() -> &'static str {
      skeleton must pass the typecheck. Implement nothing else."
 }
 
-/// `[plan]` injection at `:approve` (fill-in start).
+/// `[plan]` injection at `/approve` (fill-in start).
 pub fn fill_in_injection() -> &'static str {
     "[plan] Skeleton approved. Implement the remaining stubs; keep the approved \
      signatures unless impossible — if one must change, say so and why. Typecheck after \
@@ -142,7 +142,7 @@ pub async fn compact(_provider: &Provider, transcript: &mut [Message]) -> Result
             Message::ToolResult { call_id, content, .. } if content.len() > COMPACT_MIN_BYTES => {
                 let mut short = content.lines().next().unwrap_or("").to_string();
                 match calls.get(call_id.as_str()) {
-                    // read output never goes to debug.log — the file itself is
+                    // read output never goes to the ledger — the file itself is
                     // the recovery path.
                     Some((tool, files)) if tool == "read" => {
                         short.push_str("\n[compacted — read the file again if you need it]");
@@ -188,12 +188,22 @@ fn touched_files(call: &ToolCall) -> Vec<PathBuf> {
     }
 }
 
+/// How compaction marks text it dropped from old calls. Worded as a note,
+/// not a value: a model once copied the old `[compacted: …]` form into a
+/// real edit. `edit`/`write` refuse anything that starts with it.
+pub const ELIDED_MARK: &str = "⟨elided from history:";
+
+pub fn is_history_placeholder(s: &str) -> bool {
+    let s = s.trim_start();
+    s.starts_with(ELIDED_MARK) || s.starts_with("[compacted: ")
+}
+
 /// Collapse a write's content / an edit's strings in place, keeping the
 /// arguments valid JSON for the wire. True if anything changed.
 fn compact_payload(call: &mut ToolCall) -> bool {
     let collapse = |v: &mut serde_json::Value, what: &str| {
         let Some(text) = v.as_str().filter(|t| t.len() > COMPACT_MIN_BYTES) else { return false };
-        *v = serde_json::Value::String(format!("[compacted: {} lines {what}]", text.lines().count()));
+        *v = serde_json::Value::String(format!("{ELIDED_MARK} {} lines, already {what} — not file text⟩", text.lines().count()));
         true
     };
     let a = &mut call.arguments;
@@ -204,7 +214,7 @@ fn compact_payload(call: &mut ToolCall) -> bool {
             for hunk in a.get_mut("edits").and_then(|e| e.as_array_mut()).into_iter().flatten() {
                 for key in ["old_string", "new_string"] {
                     if let Some(v) = hunk.get_mut(key) {
-                        changed |= collapse(v, "replaced");
+                        changed |= collapse(v, "applied");
                     }
                 }
             }
@@ -287,7 +297,8 @@ mod tests {
         assert_eq!(forgotten, vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")]);
 
         let Message::Assistant { tool_calls, .. } = &transcript[0] else { panic!() };
-        assert_eq!(tool_calls[1].arguments["content"], "[compacted: 300 lines written]");
+        assert_eq!(tool_calls[1].arguments["content"], "⟨elided from history: 300 lines, already written — not file text⟩");
+        assert!(is_history_placeholder(tool_calls[1].arguments["content"].as_str().unwrap()));
         let Message::ToolResult { content, .. } = &transcript[1] else { panic!() };
         assert!(content.contains("read the file again") && !content.contains("log_search"), "{content}");
         let Message::ToolResult { content, .. } = &transcript[3] else { panic!() };

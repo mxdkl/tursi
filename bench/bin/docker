@@ -1,12 +1,13 @@
 #!/bin/sh
-# docker -> podman shim for Pier on rootless podman.
-#   * `docker compose cp` -> `podman cp` (docker-compose's cp passes a host-
-#     mapped UID that podman rejects under rootless userns)
-#   * other `docker compose ...` -> real docker-compose v2 against the podman
-#     socket, with ORIGINAL quoting preserved ("$@") — critical for `exec ...
-#     sh -c '<hook with spaces/&&/>'` collect hooks
+# docker -> podman shim for Pier and Harbor on rootless podman. Put bench/bin
+# first on PATH for the harness process only.
+#   * `docker compose cp` -> `podman cp` (compose's cp passes a host-mapped UID
+#     that podman rejects under rootless userns); the container is found by
+#     the compose labels, which both compose implementations set
+#   * other `docker compose ...` -> podman-compose, with ORIGINAL quoting
+#     preserved ("$@") — critical for `exec ... sh -c '<hook with spaces/&&/>'`
+#     collect hooks
 #   * everything else -> podman
-export DOCKER_HOST="${DOCKER_HOST:-unix:///tmp/runtime-1000/podman/podman.sock}"
 
 if [ "$1" != "compose" ]; then
     exec podman "$@"
@@ -32,10 +33,33 @@ if [ "$is_cp" -eq 1 ]; then
     done
     a=$(printf '%s\n' $rest | sed -n 1p)
     b=$(printf '%s\n' $rest | sed -n 2p)
+    container() {
+        podman ps -q --filter "label=com.docker.compose.project=$project" \
+            --filter "label=com.docker.compose.service=$1" | head -n 1
+    }
     case "$a" in
-        *:*) svc=${a%%:*}; path=${a#*:}; exec podman cp "${project}-${svc}-1:${path}" "$b" ;;  # copy out
-        *)   svc=${b%%:*}; path=${b#*:}; exec podman cp "$a" "${project}-${svc}-1:${path}" ;;   # copy in
+        *:*) svc=${a%%:*}; path=${a#*:}; exec podman cp "$(container "$svc"):${path}" "$b" ;;  # copy out
+        *)   svc=${b%%:*}; path=${b#*:}; exec podman cp "$a" "$(container "$svc"):${path}" ;;   # copy in
     esac
 fi
 
-exec docker-compose "$@"
+# podman-compose has no --project-directory: it resolves relative paths from
+# the first -f file's directory. Drop the option and pass an empty compose
+# file in that directory first instead. The loop rotates "$@" in place, so
+# quoting survives.
+dir=""
+n=$#
+while [ "$n" -gt 0 ]; do
+    a=$1; shift; n=$((n - 1))
+    if [ "$a" = "--project-directory" ]; then
+        dir=$1; shift; n=$((n - 1))
+        continue
+    fi
+    set -- "$@" "$a"
+done
+if [ -n "$dir" ]; then
+    anchor="$dir/.compose-project-dir.yaml"
+    [ -f "$anchor" ] || printf 'services: {}\n' > "$anchor"
+    exec podman-compose -f "$anchor" "$@"
+fi
+exec podman-compose "$@"

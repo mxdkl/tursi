@@ -54,7 +54,8 @@ pub async fn run(tb: &mut Toolbox, args: &Value, ui: &UiHandle) -> Result<String
             Some("command") => {
                 let command = args.command.ok_or_else(|| anyhow::anyhow!("command monitors need `command`"))?;
                 let label = args.label.unwrap_or_else(|| command.chars().take(30).collect());
-                let id = tb.monitors.watch_command(command, label.clone(), timeout, false).await?;
+                let watch = Some(crate::changes::watch(&tb.changes, tb.agent, tb.task, &command));
+                let id = tb.monitors.watch_command(command, label.clone(), timeout, false, watch).await?;
                 format!("{id} armed: {label} — end your turn; you'll be woken with its output and exit")
             }
             Some(other) => bail!("watch must be \"paths\" or \"command\", got {other:?}"),
